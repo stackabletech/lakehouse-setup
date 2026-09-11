@@ -165,38 +165,6 @@ AIRFLOW_URL=https://airflow.example.com
 S3_ENDPOINT=https://s3.example.com:9000
 ```
 
-Three are worth understanding before changing anything:
-
-`EXTERNAL_HOST` is the address every per-product hostname falls back to. It has a
-default only on minikube. Set it, or set every one of `KEYCLOAK_HOSTNAME`,
-`AIRFLOW_URL`, `TRINO_HOSTNAME`, `SUPERSET_HOSTNAME` and `NIFI_HOSTNAME` - the
-usual answer behind a load balancer, where nothing then consults it.
-
-`KEYCLOAK_HOSTNAME` and `KEYCLOAK_PORT` are the single address that browsers
-**and** every product use for Keycloak. It has to be one value: a product
-redirects the browser to the endpoints in Keycloak's discovery document, and the
-issuer in the resulting token has to match the issuer that product was configured
-with.
-
-`DAGS_GIT_TLS` has to match the scheme of `DAGS_GIT_REPO` - `webPki` for a public
-host, `null` for plain `http://`. Get it wrong and the operator refuses the whole
-`AirflowCluster` with `scheme does not match tls setting` **in its own log only**:
-the object is accepted by the API server, `.status` stays empty, no Event is
-emitted, and no StatefulSet appears. It looks like nothing happened rather than
-like a failure.
-
-Then two things that are structural rather than single values, so they are edited
-in the manifests:
-
-- **`manifests/02-s3.yaml`** - `host`, `port` and `region` on both `S3Connection`
-  objects, and the two credential Secrets at the bottom. Two identities over one
-  bucket is the point: read-only for the analyst-facing catalog, read-write for
-  the metastore, the load path and Airflow's logs. Set `region` explicitly; it is
-  part of the sigv4 signature and the three clients involved do not agree on a
-  default.
-- **the `metadataDatabase` `host`** in `30-hive-metastore.yaml`, `51-airflow.yaml`
-  and `60-superset.yaml`, and the PostgreSQL environment in `00-keycloak.yaml`.
-
 `./scripts/check-config.sh` lists anything still unfilled, reading files only, and
 `apply.sh` refuses to run while it does.
 
@@ -311,14 +279,6 @@ Locally the repository is the private `airflow-dags` repository in the Forgejo o
 it. Re-running `apply.sh` re-pushes and overwrites, so Forgejo is not the place
 to keep an edit.
 
-The four Airflow roles get a git-sync sidecar that keeps re-fetching; the
-KubernetesExecutor task pods get a git-sync init container that clones once
-before the task starts. Because git-sync exits after repeated fetch failures, an
-outage of the git server takes the Airflow pods NotReady, and a task pod whose
-init container cannot clone never starts at all - so Airflow stops rather than
-running on stale DAGs. Worth knowing when the git server is not something the
-platform team operates.
-
 ## Who sees what
 
 Three accounts ship in the realm, password equal to the username. They exist to
@@ -367,43 +327,6 @@ SUPERSET_HOSTNAME=superset.example.com
 Then apply `examples/loadbalancer/` instead of `examples/nodeports.yaml`, and
 register the five public URLs as redirect URIs on their Keycloak clients in place
 of the `*` the shipped realm uses.
-
-**What the load balancer itself has to do.** These are not in the manifests, and
-each one is a real failure if missed:
-
-| | Why |
-|---|---|
-| Reach the products on **443** | Everything derives its public URLs from `X-Forwarded-Host`, which carries no port. On any other port Superset and Airflow build redirect URIs that drop it and the browser is sent nowhere. |
-| Send `X-Forwarded-Proto`, `-Host`, `-Port` | Without them every product builds `http://` URLs on internal addresses. Standard for ingress controllers; check it on a hardware load balancer. |
-| Trust the platform CA on the backend connection | `examples/loadbalancer/truststore-secret.yaml` publishes it as a Secret. Trino, NiFi and Keycloak serve platform-issued certificates. |
-| Send the **in-cluster Service name** as SNI to Trino, NiFi and Keycloak | Their certificates carry no other name. |
-| Rewrite the `Host` header for NiFi to its Service name | NiFi's Jetty rejects a Host its certificate does not cover, with `HTTP ERROR 400 Invalid SNI`. NiFi still gets the public name from `X-Forwarded-Host`. |
-| Sticky sessions for NiFi and Superset | Both keep server-side session state. Latent at one replica; a random logout loop at two. |
-| A read timeout above the longest Trino query | Trino streams results over one long-lived exchange. The usual 60s truncates long queries with no error message. |
-
-## Credentials in these files
-
-Every password in this package is a literal in a manifest, and they are all weak
-on purpose - this is a package to be adapted, and the values are in this file.
-Before it carries anything real, change at least:
-
-- `manifests/00-keycloak.yaml` - the Keycloak admin, the four client secrets, and
-  the three user passwords, plus `directAccessGrantsEnabled` on the `trino`
-  client, which makes every realm password usable against Trino directly
-- `manifests/01-authentication.yaml` - the same four client secrets again
-- `manifests/32-trino.yaml` - the two technical users
-- `manifests/51-airflow.yaml` and `manifests/60-superset.yaml` - the bootstrap
-  admin accounts
-- `manifests/70-nifi.yaml` - the sensitive-properties key, which encrypts
-  passwords inside NiFi processor configurations. Back it up with the flow:
-  changing or losing it makes an existing flow unreadable.
-- `examples/external-credentials.yaml` - your own database and git credentials
-- `testing/01-postgres.yaml` and `testing/02-forgejo.yaml`, if you keep the
-  stand-ins anywhere that matters
-
-Every component references its credentials by Secret name only, so replacing the
-`Secret` bodies with External Secrets, Sealed Secrets or similar needs no other
-change, and is the right move for anything beyond a trial install.
 
 ## License
 
