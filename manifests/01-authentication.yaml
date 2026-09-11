@@ -1,0 +1,102 @@
+####################################################################################
+# The AuthenticationClass every product shares, and the four OIDC client secrets.
+#
+# One AuthenticationClass, four products: they differ only in which client they
+# present, so the credentials are separate Secrets and the provider configuration
+# does not repeat.
+#
+# ── FILL IN ──────────────────────────────────────────────────────────────────────
+#   CHANGEME-KEYCLOAK-HOSTNAME  }  the same Keycloak address as in
+#   CHANGEME-KEYCLOAK-PORT      }  00-keycloak.yaml, split into its parts.
+#
+# IMPORTANT - `rootPath` needs its trailing slash. Without it the operators build
+#   `/realms/sdp.well-known/openid-configuration` and discovery 404s.
+#
+# IMPORTANT - `principalClaim` decides what a username looks like everywhere
+#   downstream: what the OPA policies match on, what Trino reports in
+#   `current_user`, what the user-info fetcher has to line up with. Airflow
+#   ignores this field and reads `preferred_username` unconditionally, so
+#   anything else makes Airflow disagree with the rest of the platform about who
+#   a user is.
+#
+# IMPORTANT - the client secrets below must match the `secret` values in the realm
+#   JSON in 00-keycloak.yaml. Nothing validates that: a mismatch surfaces as a
+#   failed token exchange late in the login flow, usually as a blank error page.
+#
+# NOTE - with the port at 443 the operators omit it from the URLs they build,
+#   which is what makes the issuer they expect match the one in the token.
+####################################################################################
+---
+apiVersion: authentication.stackable.tech/v1alpha1
+kind: AuthenticationClass
+metadata:
+  name: keycloak
+spec:
+  provider:
+    oidc:
+      hostname: CHANGEME-KEYCLOAK-HOSTNAME
+      port: CHANGEME-KEYCLOAK-PORT
+      rootPath: /realms/sdp/
+      principalClaim: preferred_username
+      # Enables the operators' Keycloak-specific handling, most visibly the
+      # logout URL, which is not part of the OIDC discovery document.
+      providerHint: Keycloak
+      scopes:
+        - openid
+        - email
+        - profile
+      tls:
+        verification:
+          server:
+            # Which CA signed the certificate at CHANGEME-KEYCLOAK-HOSTNAME -
+            # Keycloak's own when reached directly, the load balancer's when
+            # behind one. Getting it wrong is not a login failure: Trino and NiFi
+            # fetch the discovery document at startup and CrashLoopBackOff with
+            # `PKIX path building failed`. See KEYCLOAK_CA in config.env.
+            CHANGEME-KEYCLOAK-CA
+---
+# Referenced by the TrinoCluster in 32-trino.yaml.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: trino-keycloak-client
+stringData:
+  clientId: trino
+  clientSecret: trino-client-secret
+---
+# Referenced by the AirflowCluster in 51-airflow.yaml.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: airflow-keycloak-client
+stringData:
+  clientId: airflow
+  clientSecret: airflow-client-secret
+---
+# Referenced by the SupersetCluster in 60-superset.yaml.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: superset-keycloak-client
+stringData:
+  clientId: superset
+  clientSecret: superset-client-secret
+---
+# Referenced by the NifiCluster in 70-nifi.yaml.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: nifi-keycloak-client
+stringData:
+  clientId: nifi
+  clientSecret: nifi-client-secret
+---
+# Referenced by the OpaCluster in 20-opa.yaml. This is a service-account client:
+# it logs nobody in, it reads group membership out of the Keycloak admin API.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: user-info-fetcher-client-credentials
+stringData:
+  clientId: user-info-fetcher
+  clientSecret: user-info-fetcher-client-secret

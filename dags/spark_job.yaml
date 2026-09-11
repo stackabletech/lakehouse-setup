@@ -1,0 +1,110 @@
+####################################################################################
+# The SparkApplication that spark_ingest_dag.py submits.
+#
+# Not applied by scripts/apply.sh: the DAG reads this file from the checkout
+# next to itself and creates the resource through the Kubernetes API. It is a
+# copy of examples/spark-iceberg-job.yaml, which carries the comments explaining
+# each setting - keep the two in step, or delete whichever is unused.
+#
+# ── FILL IN ──────────────────────────────────────────────────────────────────────
+#   CHANGEME-NAMESPACE   the namespace this is deployed into. Unlike the files
+#                        in `manifests/`, this one is NOT substituted by
+#                        scripts/apply.sh - it never passes through it. Replace
+#                        the placeholder by hand before committing this file to
+#                        the DAG repository, along with the object store
+#                        endpoint, which is written out in full here.
+####################################################################################
+---
+apiVersion: spark.stackable.tech/v1alpha1
+kind: SparkApplication
+metadata:
+  name: airflow-ingest
+spec:
+  sparkImage:
+    productVersion: 4.1.2
+  mode: cluster
+  mainApplicationFile: local:///stackable/spark/jobs/spark_ingest.py
+  s3connection:
+    reference: lakehouse-rw
+  deps:
+    packages:
+      - org.apache.iceberg:iceberg-spark-runtime-4.1_2.13:1.11.0
+      - org.apache.iceberg:iceberg-aws-bundle:1.11.0
+  sparkConf:
+    # See examples/spark-iceberg-job.yaml for what each of these does.
+    spark.authenticate: "true"
+    spark.network.crypto.enabled: "true"
+    spark.io.encryption.enabled: "true"
+    spark.io.encryption.keySizeBits: "256"
+    spark.ssl.ui.enabled: "true"
+    spark.ssl.ui.keyStore: /stackable/tls/keystore.p12
+    spark.ssl.ui.keyStorePassword: ""
+    spark.ssl.ui.keyStoreType: PKCS12
+    spark.ssl.ui.protocol: TLSv1.3
+
+    spark.hadoop.fs.s3a.endpoint: https://minio.CHANGEME-NAMESPACE.svc.cluster.local:9000
+    spark.hadoop.fs.s3a.endpoint.region: us-east-1
+    spark.hadoop.fs.s3a.path.style.access: "true"
+
+    spark.sql.extensions: org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
+    spark.sql.catalog.lakehouse: org.apache.iceberg.spark.SparkCatalog
+    spark.sql.catalog.lakehouse.type: hive
+    spark.sql.catalog.lakehouse.uri: thrift://hive-iceberg-metastore:9083
+    spark.sql.catalog.lakehouse.warehouse: s3://lakehouse/warehouse
+    spark.sql.catalog.lakehouse.io-impl: org.apache.iceberg.aws.s3.S3FileIO
+    spark.sql.catalog.lakehouse.s3.endpoint: https://minio.CHANGEME-NAMESPACE.svc.cluster.local:9000
+    spark.sql.catalog.lakehouse.s3.path-style-access: "true"
+    spark.sql.catalog.lakehouse.client.region: us-east-1
+
+    spark.kubernetes.driver.secretKeyRef.AWS_ACCESS_KEY_ID: lakehouse-rw-credentials:accessKey
+    spark.kubernetes.driver.secretKeyRef.AWS_SECRET_ACCESS_KEY: lakehouse-rw-credentials:secretKey
+    spark.kubernetes.executor.secretKeyRef.AWS_ACCESS_KEY_ID: lakehouse-rw-credentials:accessKey
+    spark.kubernetes.executor.secretKeyRef.AWS_SECRET_ACCESS_KEY: lakehouse-rw-credentials:secretKey
+  job:
+    config:
+      resources:
+        cpu: {min: 300m, max: "1"}
+        memory: {limit: 512Mi}
+      volumeMounts:
+        - name: jobs
+          mountPath: /stackable/spark/jobs
+  driver:
+    config:
+      resources:
+        cpu: {min: 600m, max: "2"}
+        memory: {limit: 1Gi}
+      volumeMounts: &mounts
+        - name: jobs
+          mountPath: /stackable/spark/jobs
+        - name: tls
+          mountPath: /stackable/tls
+  executor:
+    replicas: 2
+    config:
+      resources:
+        cpu: {min: 600m, max: "2"}
+        memory: {limit: 1Gi}
+      volumeMounts: *mounts
+  volumes:
+    - name: jobs
+      configMap:
+        name: spark-jobs
+    - name: tls
+      ephemeral:
+        volumeClaimTemplate:
+          metadata:
+            annotations:
+              secrets.stackable.tech/class: tls
+              secrets.stackable.tech/scope: pod
+              secrets.stackable.tech/format: tls-pkcs12
+              # A week, matching the products. The load job finishes in minutes,
+              # so this is only insurance: the restart-controller deletes a pod
+              # at its certificate expiry, and for a driver pod that is the job
+              # failing rather than a restart.
+              secrets.stackable.tech/backend.autotls.cert.lifetime: 7d
+          spec:
+            accessModes: ["ReadWriteOnce"]
+            resources:
+              requests:
+                storage: "1"
+            storageClassName: secrets.stackable.tech

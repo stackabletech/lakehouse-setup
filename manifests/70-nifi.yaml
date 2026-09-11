@@ -1,0 +1,115 @@
+####################################################################################
+# Apache NiFi - dataflow.
+#
+# Keycloak OIDC for authentication, the same realm and AuthenticationClass as
+# everything else; OPA for authorization, using 24-opa-nifi-policies.yaml.
+# Cluster state lives in Kubernetes rather than ZooKeeper, which is what leaving
+# `zookeeperConfigMapName` unset selects - no ensemble needed.
+#
+# ── FILL IN ──────────────────────────────────────────────────────────────────────
+#   CHANGEME-NIFI-HOSTNAME        the public hostname. NiFi refuses a Host header
+#   CHANGEME-NIFI-LISTENER-CLASS  it does not know; both are set in config.env.
+#
+# IMPORTANT - `sensitiveProperties.keySecret` encrypts passwords and tokens
+#   inside processor configurations. Losing or changing it makes an existing flow
+#   unreadable and NiFi refuses to start rather than dropping the values. Back it
+#   up with the flow. `autoGenerate: false` is deliberate: a generated key lives
+#   only in an operator-created Secret, easy to destroy with the namespace and
+#   hard to restore a flow without.
+#
+# IMPORTANT - NiFi cannot sit behind the fixed NodePorts in
+#   examples/nodeports.yaml. Its Jetty rejects any request whose Host its
+#   certificate does not cover, with `HTTP ERROR 400 Invalid SNI` - which reads
+#   like a TLS problem and is really a hostname one. A Service-scoped certificate
+#   covers only `nifi-node.<namespace>.svc.cluster.local`, so the node address
+#   fails. `external-unstable` fixes it: the listener-operator puts the node
+#   address in the certificate and provisions the NodePort itself. The price is a
+#   dynamically assigned port that changes when the Listener is re-created -
+#   hence "unstable" - so scripts/access.sh reads it rather than assuming one.
+#
+# NOTE - one node here. NiFi clusters through the Kubernetes state provider and
+#   raising `replicas` is all it takes, but note the `/proxy` rule in
+#   24-opa-nifi-policies.yaml, without which the nodes cannot forward requests to
+#   each other.
+#
+# NOTE - no flow ships. A flow is deployment-specific and this package is the
+#   platform, not the pipeline. Build one in the canvas, or load it from a
+#   registry through `customComponentsGitSync`.
+####################################################################################
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: nifi-sensitive-property-key
+type: Opaque
+stringData:
+  # At least 12 characters. Change it before this leaves a test cluster, and
+  # keep it - see the header note.
+  nifiSensitivePropsKey: nifi-sensitive-property-key-change-me
+---
+apiVersion: nifi.stackable.tech/v1alpha1
+kind: NifiCluster
+metadata:
+  name: nifi
+spec:
+  image:
+    productVersion: 2.6.0
+  clusterConfig:
+    authentication:
+      - authenticationClass: keycloak
+        oidc:
+          clientCredentialsSecret: nifi-keycloak-client
+    authorization:
+      opa:
+        configMapName: opa
+        package: nifi
+    sensitiveProperties:
+      keySecret: nifi-sensitive-property-key
+      autoGenerate: false
+    hostHeaderCheck:
+      # NiFi rejects a request whose Host it does not recognise. The operator
+      # allows the Kubernetes Service names by default; the public hostname has
+      # to be named as well.
+      additionalAllowedHosts:
+        - CHANGEME-NIFI-HOSTNAME
+      # SECURITY DECISION, left at the SDP default deliberately. `true` disables
+      # host header validation altogether, which is what makes direct NodePort
+      # access work: the check matches host AND port, and that port is assigned
+      # dynamically, so it cannot be listed ahead of time.
+      #
+      # Behind a load balancer the port is fixed and known. Set this to `false`
+      # there - the list above becomes the allow list and NiFi stops answering
+      # to arbitrary Host headers. Add the port if the proxy forwards a
+      # non-default one.
+      allowAll: true
+  nodes:
+    roleConfig:
+      # `external-unstable` for direct NodePort access, `cluster-internal`
+      # behind a load balancer. See the header note on Invalid SNI.
+      listenerClass: CHANGEME-NIFI-LISTENER-CLASS
+    config:
+      # The node keystore, a week rather than the default day. A NiFi node
+      # restart drops the flow's in-flight state, so daily is expensive here.
+      requestedSecretLifetime: 7d
+      resources:
+        cpu: {min: 500m, max: "2"}
+        memory: {limit: 2Gi}
+    # A week-long certificate rather than the default day, so the
+    # restart-controller stops bouncing this pod daily. The volume holds only
+    # the platform CA and no CRD field reaches it, hence the override. The empty
+    # `spec: {}` merges into the operator's own volume by name; naming one the
+    # operator did not create wedges it in a failing reconcile. See README.md,
+    # "How long certificates last".
+    podOverrides:
+      spec:
+        volumes:
+          - name: tls-ca-cert
+            ephemeral:
+              volumeClaimTemplate:
+                metadata:
+                  annotations:
+                    secrets.stackable.tech/backend.autotls.cert.lifetime: 7d
+                spec: {}
+    roleGroups:
+      default:
+        replicas: 1

@@ -1,0 +1,68 @@
+####################################################################################
+# Trino catalogs.
+#
+# Two catalogs over the SAME metastore and the SAME bucket, differing only in the
+# S3 identity. That is what makes analyst read-only access enforceable at the
+# object store rather than only in policy:
+#
+#   lakehouse        read-only S3 identity   - what everyone queries
+#   lakehousewrite   read-write S3 identity  - granted only to the technical
+#                                              user in 22-opa-trino-policies.yaml
+#
+# A write through `lakehouse` fails in the S3 layer whatever the policy engine
+# would have said. Tables written through `lakehousewrite` are immediately
+# visible under `lakehouse`, because both point at the same metastore.
+#
+# `tpch` is a built-in generated dataset needing neither metastore nor object
+# store, which makes it the cheapest way to tell "Trino is broken" apart from
+# "the lakehouse is broken". Nothing to fill in.
+#
+# IMPORTANT - catalog names must be RFC 1123 labels. The operator maps the
+#   resource name straight to the Trino catalog name, so no underscores.
+#
+# IMPORTANT - catalogs must exist before the TrinoCluster, or the coordinator
+#   starts without them and needs a restart to pick them up. Numeric filename
+#   order takes care of it.
+#   See https://github.com/stackabletech/trino-operator/issues/854
+####################################################################################
+---
+apiVersion: trino.stackable.tech/v1alpha1
+kind: TrinoCatalog
+metadata:
+  name: lakehouse
+  labels:
+    # Must match spec.clusterConfig.catalogLabelSelector in 32-trino.yaml.
+    trino: trino
+spec:
+  connector:
+    iceberg:
+      metastore:
+        # The HiveCluster name. The operator publishes a discovery ConfigMap
+        # under that name, carrying the Thrift address.
+        configMap: hive-iceberg
+      s3:
+        reference: lakehouse-ro
+---
+apiVersion: trino.stackable.tech/v1alpha1
+kind: TrinoCatalog
+metadata:
+  name: lakehousewrite
+  labels:
+    trino: trino
+spec:
+  connector:
+    iceberg:
+      metastore:
+        configMap: hive-iceberg
+      s3:
+        reference: lakehouse-rw
+---
+apiVersion: trino.stackable.tech/v1alpha1
+kind: TrinoCatalog
+metadata:
+  name: tpch
+  labels:
+    trino: trino
+spec:
+  connector:
+    tpch: {}

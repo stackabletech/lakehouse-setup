@@ -1,0 +1,68 @@
+####################################################################################
+# Trust anchor for TLS servers the platform does not operate.
+#
+# APPLY ONLY IF something the platform connects to presents a certificate from a
+# private CA. Two things can: the object store when it is not the local MinIO,
+# and the load balancer in front of Keycloak when its certificate is not publicly
+# trusted. Both can share this one SecretClass, or copy this file per endpoint if
+# they are signed by different CAs - the names in config.env wire them up and
+# nothing requires them to match.
+#
+# Publicly trusted certificates need `webPki: {}` in config.env instead, and
+# platform-issued ones (the local MinIO) need nothing at all.
+#
+# This distributes a CA certificate only. No private key is involved and the
+# platform issues nothing from this CA.
+#
+# ── FILL IN ──────────────────────────────────────────────────────────────────────
+#   CHANGEME-CA-CERTIFICATE   the CA certificate chain in PEM, BEGIN/END lines
+#                             included, indented to the column shown.
+#                             Certificate(s) only - never a private key.
+#
+# Then in config.env, for whichever endpoints it covers:
+#   S3_CA="caCert: {secretClass: external-ca}"
+#   KEYCLOAK_CA="caCert: {secretClass: external-ca}"
+#
+# IMPORTANT - the server certificate this CA signed must carry a SAN for exactly
+#   the configured hostname (`host` in manifests/02-s3.yaml, or
+#   KEYCLOAK_HOSTNAME). A missing SAN does not merely break a connection: Trino
+#   and NiFi fetch the discovery document at startup and CrashLoopBackOff rather
+#   than failing a login.
+#
+# IMPORTANT - Airflow does not use this SecretClass. boto3 wants a CA file on
+#   disk, so 51-airflow.yaml mounts the Secret below directly. That is why
+#   S3_CA_VOLUME exists alongside S3_CA, and why the two have to agree - nothing
+#   checks that they do.
+#
+# NOTE - when switching a CA, change config.env, apply, and only THEN delete the
+#   old Secret. A pod's spec is immutable, so one created against the old volume
+#   source keeps trying to mount it: removing the Secret first wedges it in
+#   ContainerCreating with `MountVolume.SetUp failed ... not found`, and updating
+#   the StatefulSet does not rescue it. Deleting the pod does.
+#
+# NOTE - pods read this certificate once, at startup. After updating the Secret,
+#   restart every consumer: Hive metastore, Trino coordinator and workers,
+#   Airflow, Superset, NiFi, OPA. No operator watches it.
+####################################################################################
+---
+apiVersion: secrets.stackable.tech/v1alpha1
+kind: SecretClass
+metadata:
+  name: external-ca
+spec:
+  backend:
+    k8sSearch:
+      searchNamespace:
+        pod: {}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: external-ca
+  # This label is what binds the Secret to the SecretClass above. Without it the
+  # mount hangs rather than erroring, which is a slow way to find a typo.
+  labels:
+    secrets.stackable.tech/class: external-ca
+stringData:
+  ca.crt: |
+    CHANGEME-CA-CERTIFICATE

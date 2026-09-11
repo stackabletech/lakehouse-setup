@@ -1,0 +1,99 @@
+####################################################################################
+# Open Policy Agent - the authorization engine for Trino, Superset and NiFi.
+#
+# One OPA stacklet serves all three, each asking a different Rego package:
+#
+#   trino      21/22-*  which catalogs, schemas, tables and columns a user sees
+#   superset   23-*     which Superset roles a user is granted at login
+#   nifi       24-*     which NiFi resources a user may read or write
+#
+# Two things are configured here. The user-info backend resolves a username to
+# the Keycloak groups it belongs to - all three policy sets decide on group
+# membership, so it is the bridge between "who logged in" and "what they may do".
+# Decision logging writes one JSON record per decision (user, operation,
+# resource, result, any row filter or column mask, decision ID, timestamp), and
+# that is the audit trail.
+#
+# ── FILL IN ──────────────────────────────────────────────────────────────────────
+#   CHANGEME-NAMESPACE   the namespace this is deployed into.
+#
+# NOTE - the user-info fetcher reaches Keycloak on the in-cluster Service name
+#   rather than the external address the AuthenticationClass uses. It is a
+#   back-channel call against the admin API, not a browser redirect, so there is
+#   no issuer to match; `KC_HOSTNAME_BACKCHANNEL_DYNAMIC` in 00-keycloak.yaml is
+#   what makes Keycloak accept it.
+#
+# NOTE - if OPA cannot reach Keycloak, group resolution fails and OPA denies. A
+#   TLS or credential problem therefore surfaces as PERMISSION_DENIED in Trino or
+#   an empty Superset. Read the `user-info-fetcher` container log before
+#   suspecting the policies.
+#
+# NOTE - the decision log goes to stdout and lives as long as the pod. Forward it
+#   to a log store for retention and tamper-evidence; filter on `logger=decision`.
+#   Expect several records per Trino query, one per authorization check.
+#
+# NOTE - it holds no SQL text and no query completion event: what was authorized,
+#   not what was delivered. It covers only what asks OPA - direct object-store
+#   access, Spark jobs and metastore calls never appear.
+####################################################################################
+---
+apiVersion: opa.stackable.tech/v1alpha1
+kind: OpaCluster
+metadata:
+  name: opa
+spec:
+  image:
+    productVersion: 1.16.2
+  clusterConfig:
+    userInfo:
+      backend:
+        keycloak:
+          # Fully qualified: the certificate the platform CA issues for a
+          # Service scope covers this name and not the short `keycloak`.
+          hostname: keycloak.CHANGEME-NAMESPACE.svc.cluster.local
+          port: 8443
+          tls:
+            verification:
+              server:
+                caCert:
+                  secretClass: tls
+          clientCredentialsSecret: user-info-fetcher-client-credentials
+          # The realm holding the users, and the realm whose admin API is used
+          # to look them up. One realm here, so both are `sdp`.
+          adminRealm: sdp
+          userRealm: sdp
+  servers:
+    config:
+      logging:
+        containers:
+          opa:
+            console:
+              level: INFO
+            file:
+              level: INFO
+            loggers:
+              # This is the audit trail. Do not lower below INFO.
+              decision:
+                level: INFO
+      resources:
+        cpu: {min: 200m, max: "1"}
+        memory: {limit: 512Mi}
+    # A week-long certificate rather than the default day, so the
+    # restart-controller stops bouncing this pod daily. The volume holds only
+    # the platform CA and no CRD field reaches it, hence the override. The empty
+    # `spec: {}` merges into the operator's own volume by name; naming one the
+    # operator did not create wedges it in a failing reconcile. See README.md,
+    # "How long certificates last".
+    podOverrides:
+      spec:
+        volumes:
+          - name: tls-ca-cert
+            ephemeral:
+              volumeClaimTemplate:
+                metadata:
+                  annotations:
+                    secrets.stackable.tech/backend.autotls.cert.lifetime: 7d
+                spec: {}
+    roleGroups:
+      default:
+        replicas: 1

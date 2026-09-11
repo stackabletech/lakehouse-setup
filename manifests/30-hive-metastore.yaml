@@ -1,0 +1,78 @@
+####################################################################################
+# Hive metastore - the Iceberg catalog.
+#
+# Holds Iceberg table metadata and performs the atomic metadata-pointer swap that
+# makes concurrent commits safe. Trino and Spark both reach it over Thrift, and
+# both must go through it rather than reading table metadata from the object
+# store directly - that shared catalog is what makes a Spark write visible to a
+# Trino query. It is stateless; durability is PostgreSQL's job, so availability
+# is just more replicas.
+#
+# Nothing to fill in, but two things come from outside: the `hive` database on
+# the PostgreSQL server below, with the `hive-postgres-credentials` Secret from
+# examples/external-credentials.yaml, and the read-write connection in
+# 02-s3.yaml.
+#
+# IMPORTANT - version 4.0.0 is deliberate, do not raise it. Hive 4.2.0 does not
+#   answer the Thrift `get_table` call the Spark Iceberg runtime makes. Namespace
+#   operations still succeed, so the connection looks healthy and only table
+#   access fails - and the Spark application still reports `Succeeded`. Trino is
+#   unaffected.
+#
+# IMPORTANT - the two `fs.s3*` overrides are required. Trino and Iceberg address
+#   data with `s3://` while the bundled Hadoop distribution registers only
+#   `s3a://`. Without the mapping the metastore cannot create schema and table
+#   directories, and CREATE fails with "Failed to create external path".
+#
+# IMPORTANT - the read-write S3 connection is not optional. The metastore creates
+#   those directories itself; on the read-only identity it fails on first CREATE.
+#
+# NOTE - restart the metastore pods after changing the S3Connection (endpoint,
+#   credentials, CA). The operator does not notice.
+####################################################################################
+---
+apiVersion: hive.stackable.tech/v1alpha1
+kind: HiveCluster
+metadata:
+  name: hive-iceberg
+spec:
+  image:
+    productVersion: 4.0.0
+  clusterConfig:
+    metadataDatabase:
+      postgresql:
+        host: postgres
+        port: 5432
+        database: hive
+        credentialsSecretName: hive-postgres-credentials
+    s3:
+      reference: lakehouse-rw
+  metastore:
+    configOverrides:
+      hive-site.xml:
+        fs.s3.impl: org.apache.hadoop.fs.s3a.S3AFileSystem
+        fs.AbstractFileSystem.s3.impl: org.apache.hadoop.fs.s3a.S3A
+    config:
+      resources:
+        cpu: {min: 300m, max: "2"}
+        memory: {limit: 1Gi}
+    # A week-long certificate rather than the default day, so the
+    # restart-controller stops bouncing this pod daily. The volume holds only
+    # the platform CA and no CRD field reaches it, hence the override. The empty
+    # `spec: {}` merges into the operator's own volume by name; naming one the
+    # operator did not create wedges it in a failing reconcile. See README.md,
+    # "How long certificates last".
+    podOverrides:
+      spec:
+        volumes:
+          - name: tls-ca-cert
+            ephemeral:
+              volumeClaimTemplate:
+                metadata:
+                  annotations:
+                    secrets.stackable.tech/backend.autotls.cert.lifetime: 7d
+                spec: {}
+    roleGroups:
+      default:
+        # Stateless - raise for availability. One is enough locally.
+        replicas: 1

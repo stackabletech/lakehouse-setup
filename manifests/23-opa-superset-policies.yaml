@@ -1,0 +1,75 @@
+####################################################################################
+# Superset authorization policy - Keycloak group to Superset role.
+#
+# Superset asks OPA once per login, with `{"input": {"username": "<name>"}}`, and
+# expects a list of Superset role NAMES back. OPA does not create roles: every
+# name returned must already exist in the Superset metadata database. `Admin`,
+# `Alpha`, `Gamma`, `sql_lab` and `Public` are built in; a name that does not
+# resolve is logged and dropped.
+#
+# The security manager REPLACES a user's roles on every successful login, so
+# this rule is the only thing that decides what a user can do in Superset.
+# Editing roles in the Superset UI has no lasting effect.
+#
+# No values to fill in here.
+#
+# IMPORTANT - never return an empty list. Superset raises
+#   `AttributeError: User object does not have roles or groups` and answers
+#   HTTP 500 for a user with no roles at all - it does not render a "no access"
+#   page. `Public` carries zero permissions, so it is an empty but *valid*
+#   answer: the user logs in, sees nothing, and gets no 500. That is what
+#   `carol` exercises.
+#
+# NOTE - the mapping is explicit rather than naming the Keycloak groups after
+#   Superset roles. That keeps Superset's vocabulary out of the identity
+#   provider, which matters when the same groups also drive Trino and NiFi.
+#
+# NOTE - `Gamma` alone cannot use SQL Lab. Analysts here get `Gamma` and
+#   `sql_lab` together, which is the usual analyst combination: browse
+#   dashboards, and query the lakehouse directly.
+####################################################################################
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: superset-policies
+  labels:
+    opa.stackable.tech/bundle: "true"
+data:
+  superset_policies.rego: |
+    package superset
+
+    role_by_group := {
+      "/admins": ["Admin"],
+      "/analysts": ["Gamma", "sql_lab"],
+    }
+
+    # The operator-managed break-glass account is not a Keycloak user, so the
+    # user-info lookup cannot resolve it. Granting it here explicitly is
+    # deliberate: without this rule `admin` authenticates fine and then lands
+    # with no roles at all.
+    local_admins := {"admin"}
+
+    # `Public` exists by default and carries zero permissions. See the header.
+    fallback_roles := ["Public"]
+
+    user_roles := ["Admin"] if {
+      input.username in local_admins
+    }
+
+    user_roles := roles if {
+      not input.username in local_admins
+      groups := data.stackable.opa.userinfo.v1.userInfoByUsername(input.username).groups
+      mapped := [role |
+        some group in groups
+        some role in role_by_group[group]
+      ]
+      count(mapped) > 0
+      roles := mapped
+    }
+
+    user_roles := fallback_roles if {
+      not input.username in local_admins
+      groups := data.stackable.opa.userinfo.v1.userInfoByUsername(input.username).groups
+      count([role | some group in groups; some role in role_by_group[group]]) == 0
+    }

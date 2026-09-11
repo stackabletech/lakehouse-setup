@@ -1,0 +1,208 @@
+####################################################################################
+# External access behind a load balancer: one hostname per product.
+#
+# Written for ingress-nginx. A hardware or cloud load balancer needs the same
+# things in its own vocabulary - the full list is in README.md, "Behind a load
+# balancer", and none of it is optional.
+#
+# The topology: the load balancer terminates the browser's TLS with a publicly
+# trusted certificate, then opens a NEW TLS connection to the product, validating
+# it against the platform's own CA. That is what `backend-protocol: HTTPS` and
+# the `proxy-ssl-*` annotations arrange.
+#
+# Exercised on minikube against ingress-nginx 1.11.3 with nip.io hostnames: all
+# five products reachable, and full Keycloak logins through it for Superset,
+# Airflow and NiFi with the expected per-user authorization.
+#
+# ── FILL IN ──────────────────────────────────────────────────────────────────────
+#   Every `*.example.com` hostname, and every `CHANGEME-NAMESPACE`. These are the
+#   same values as in config.env - keep them in step, nothing checks that they
+#   agree. Each `secretName` must hold the publicly trusted certificate for that
+#   hostname; this package does not issue those.
+#
+# IMPORTANT - apply this INSTEAD OF examples/nodeports.yaml. Leaving the
+#   NodePorts in place publishes every product a second time, bypassing the load
+#   balancer and whatever it enforces.
+#
+# IMPORTANT - Trino and NiFi serve HTTPS with platform-issued certificates while
+#   Airflow and Superset serve plain HTTP, so the backend annotations differ per
+#   product. Backwards produces a 502 with nothing useful in the ingress log.
+#
+# IMPORTANT - the `proxy-ssl-name` annotations are load-bearing. Trino's, NiFi's
+#   and Keycloak's certificates are issued for their in-cluster Service names, so
+#   that is the name the proxy's own TLS client has to ask for and verify.
+#
+# IMPORTANT - the load balancer must reach the products on 443. Everything here
+#   derives its public URLs from X-Forwarded-Host, which nginx sets WITHOUT the
+#   port. On any other port Superset and Airflow build redirect URIs that drop
+#   it, and the browser is sent somewhere nothing is listening.
+#
+# IMPORTANT - do NOT use `configuration-snippet`. Current ingress-nginx refuses
+#   it by default (`Snippet directives are disabled by the Ingress
+#   administrator`) and rejects the Ingress outright. Nothing here needs one.
+#
+# IMPORTANT - the read timeouts. A Trino query streams results over a long-lived
+#   HTTP exchange and the default 60s cuts anything slower, with a truncated
+#   result or a connection reset rather than an error - which reads as Trino
+#   being unstable under load.
+#
+# NOTE - `cluster-internal-ca-tls` is the platform CA as a Secret, produced by
+#   truststore-secret.yaml beside this file. Apply that one too;
+#   manifests/03-truststore.yaml publishes the same CA as a ConfigMap for the
+#   pods, and ingress-nginx wants a Secret, hence two copies.
+####################################################################################
+---
+# Trino - HTTPS backend, long timeouts, and no request buffering so results
+# stream rather than accumulating in the proxy.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: trino
+  annotations:
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+    nginx.ingress.kubernetes.io/proxy-ssl-secret: "CHANGEME-NAMESPACE/cluster-internal-ca-tls"
+    nginx.ingress.kubernetes.io/proxy-ssl-name: "trino-coordinator.CHANGEME-NAMESPACE.svc.cluster.local"
+    nginx.ingress.kubernetes.io/proxy-ssl-verify: "on"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: trino.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: trino-coordinator
+                port:
+                  number: 8443
+  tls:
+    - hosts: [trino.example.com]
+      secretName: trino-public-tls
+---
+# Airflow - plain HTTP backend. AIRFLOW__FAB__ENABLE_PROXY_FIX in
+# manifests/51-airflow.yaml is what makes it believe the X-Forwarded-Proto
+# below rather than the http:// it actually sees.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: airflow
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: airflow.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: airflow-webserver
+                port:
+                  number: 8080
+  tls:
+    - hosts: [airflow.example.com]
+      secretName: airflow-public-tls
+---
+# Superset - plain HTTP backend. Sticky sessions because Superset keeps its
+# login session in a signed cookie tied to a server-side session; with more than
+# one replica and no affinity, a user is logged out at random.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: superset
+  annotations:
+    nginx.ingress.kubernetes.io/affinity: "cookie"
+    nginx.ingress.kubernetes.io/session-cookie-name: "superset-affinity"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: superset.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: superset-node
+                port:
+                  number: 8088
+  tls:
+    - hosts: [superset.example.com]
+      secretName: superset-public-tls
+---
+# NiFi - HTTPS backend, a rewritten Host, and sticky sessions.
+#
+# `upstream-vhost` is the one that is not obvious and not optional. NiFi's Jetty
+# rejects any request whose Host its own certificate does not cover, answering
+# `HTTP ERROR 400 Invalid SNI` - which reads like a TLS fault and is a hostname
+# mismatch. Its certificate is issued for the in-cluster Service name, so that
+# is what has to be sent upstream. The public hostname still reaches NiFi
+# through X-Forwarded-Host, which is what it builds its own URLs from: verified
+# by NiFi reporting its `loginUri` as the public address, not the internal one.
+#
+# Sticky sessions are not optional once there is more than one node - the UI
+# holds server-side state per node.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: nifi
+  annotations:
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+    nginx.ingress.kubernetes.io/proxy-ssl-secret: "CHANGEME-NAMESPACE/cluster-internal-ca-tls"
+    nginx.ingress.kubernetes.io/proxy-ssl-name: "nifi-node.CHANGEME-NAMESPACE.svc.cluster.local"
+    nginx.ingress.kubernetes.io/proxy-ssl-verify: "on"
+    nginx.ingress.kubernetes.io/upstream-vhost: "nifi-node.CHANGEME-NAMESPACE.svc.cluster.local"
+    nginx.ingress.kubernetes.io/affinity: "cookie"
+    nginx.ingress.kubernetes.io/session-cookie-name: "nifi-affinity"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: nifi.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: nifi-node
+                port:
+                  number: 8443
+  tls:
+    - hosts: [nifi.example.com]
+      secretName: nifi-public-tls
+---
+# Keycloak - HTTPS backend. This is the address every product was configured
+# with, so it has to match KEYCLOAK_HOSTNAME in config.env exactly.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: keycloak
+  annotations:
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+    nginx.ingress.kubernetes.io/proxy-ssl-secret: "CHANGEME-NAMESPACE/cluster-internal-ca-tls"
+    nginx.ingress.kubernetes.io/proxy-ssl-name: "keycloak.CHANGEME-NAMESPACE.svc.cluster.local"
+    nginx.ingress.kubernetes.io/proxy-ssl-verify: "on"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: keycloak.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: keycloak
+                port:
+                  number: 8443
+  tls:
+    - hosts: [keycloak.example.com]
+      secretName: keycloak-public-tls

@@ -1,0 +1,324 @@
+####################################################################################
+# Keycloak - the identity provider.
+#
+# Every human login goes through here: Trino, Airflow, Superset and NiFi all
+# authenticate against the realm imported below, and OPA reads group membership
+# out of it to decide what they may do.
+#
+# ── FILL IN ──────────────────────────────────────────────────────────────────────
+#   CHANGEME-KEYCLOAK-URL   the full origin browsers and products use, e.g.
+#                           `https://keycloak.example.com`. Set in config.env.
+#
+# IMPORTANT - Keycloak must be reachable at ONE address that works from both
+#   sides. Products redirect the browser to the endpoints in the discovery
+#   document, and Keycloak builds those from `KC_HOSTNAME`. The in-cluster
+#   Service name would not resolve for a browser; a Service name for products and
+#   a node address for browsers would put an issuer in the token that does not
+#   match the configured one, failing every login. So all of them use the single
+#   value of CHANGEME-KEYCLOAK-URL.
+#
+# IMPORTANT - the server certificate is issued with scope `node`, which puts the
+#   node's IP in the SAN list and is what makes the node address usable for TLS.
+#   A Service scope would add nothing: nothing addresses Keycloak by Service name
+#   here. Browsers warn about the unknown CA, which is expected - it is the
+#   platform's own. The products are given it through `caCert.secretClass: tls`.
+#
+# NOTE - `start-dev` skips the production hostname and TLS strictness checks and
+#   enables the realm import below. Production uses `start` with `KC_HOSTNAME` on
+#   a real DNS name and a certificate for it.
+#
+# NOTE - realm import is idempotent by omission: the realm is imported only if it
+#   does not exist. Editing it here and restarting changes nothing while
+#   PostgreSQL still holds the old one. Delete the realm in the UI first, or
+#   reset the database.
+#
+# NOTE - `directAccessGrantsEnabled` on the `trino` client lets a script get a
+#   token from a username and password instead of a browser flow, which is how
+#   the smoke test checks the policies as `alice` and `carol`. Turn it off on
+#   anything but a test cluster: it makes every realm password usable against
+#   Trino directly.
+#
+# NOTE - the four client secrets appear twice, here and in the Secrets the
+#   products read (01-authentication.yaml). Changing one means changing both.
+####################################################################################
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: keycloak-realm
+data:
+  # ── Accounts this realm ships with ────────────────────────────────────────
+  #
+  #   bob    / bob    /admins    Airflow Admin, Superset Admin, NiFi full
+  #                              access, unmasked lakehouse data
+  #   alice  / alice  /analysts  Airflow User, Superset Gamma, NiFi read-only,
+  #                              masked lakehouse data, EMEA rows only
+  #   carol  / carol  (no group) authenticates everywhere, sees nothing. The
+  #                              case worth testing: realm membership alone must
+  #                              not grant access.
+  #
+  # Two service accounts have no password and never log in:
+  #   user-info-fetcher   OPA reads group membership through it
+  #   (the Trino/Airflow/Superset/NiFi clients are confidential OIDC clients)
+  sdp-realm.json: |
+    {
+      "realm": "sdp",
+      "enabled": true,
+      "sslRequired": "none",
+      "groups": [
+        { "name": "admins",   "path": "/admins" },
+        { "name": "analysts", "path": "/analysts" }
+      ],
+      "users": [
+        {
+          "enabled": true,
+          "username": "bob",
+          "firstName": "Bob",
+          "lastName": "Boss",
+          "email": "bob@stackable.test",
+          "emailVerified": true,
+          "credentials": [{ "type": "password", "value": "bob" }],
+          "groups": ["/admins"]
+        },
+        {
+          "enabled": true,
+          "username": "alice",
+          "firstName": "Alice",
+          "lastName": "Analyst",
+          "email": "alice@stackable.test",
+          "emailVerified": true,
+          "credentials": [{ "type": "password", "value": "alice" }],
+          "groups": ["/analysts"]
+        },
+        {
+          "enabled": true,
+          "username": "carol",
+          "firstName": "Carol",
+          "lastName": "Contractor",
+          "email": "carol@stackable.test",
+          "emailVerified": true,
+          "credentials": [{ "type": "password", "value": "carol" }],
+          "groups": []
+        },
+        {
+          "username": "service-account-user-info-fetcher",
+          "enabled": true,
+          "serviceAccountClientId": "user-info-fetcher",
+          "clientRoles": {
+            "realm-management": ["view-users", "query-groups"]
+          }
+        }
+      ],
+      "clients": [
+        {
+          "clientId": "trino",
+          "enabled": true,
+          "protocol": "openid-connect",
+          "clientAuthenticatorType": "client-secret",
+          "secret": "trino-client-secret",
+          "standardFlowEnabled": true,
+          "publicClient": false,
+          "directAccessGrantsEnabled": true,
+          "redirectUris": ["*"],
+          "webOrigins": ["*"],
+          "protocolMappers": [
+            {
+              "name": "groups",
+              "protocol": "openid-connect",
+              "protocolMapper": "oidc-group-membership-mapper",
+              "config": {
+                "claim.name": "groups",
+                "full.path": "true",
+                "id.token.claim": "true",
+                "access.token.claim": "true",
+                "userinfo.token.claim": "true"
+              }
+            }
+          ]
+        },
+        {
+          "clientId": "airflow",
+          "enabled": true,
+          "protocol": "openid-connect",
+          "clientAuthenticatorType": "client-secret",
+          "secret": "airflow-client-secret",
+          "standardFlowEnabled": true,
+          "publicClient": false,
+          "redirectUris": ["*"],
+          "webOrigins": ["*"],
+          "protocolMappers": [
+            {
+              "name": "groups",
+              "protocol": "openid-connect",
+              "protocolMapper": "oidc-group-membership-mapper",
+              "config": {
+                "claim.name": "groups",
+                "full.path": "true",
+                "id.token.claim": "true",
+                "access.token.claim": "true",
+                "userinfo.token.claim": "true"
+              }
+            }
+          ]
+        },
+        {
+          "clientId": "superset",
+          "enabled": true,
+          "protocol": "openid-connect",
+          "clientAuthenticatorType": "client-secret",
+          "secret": "superset-client-secret",
+          "standardFlowEnabled": true,
+          "publicClient": false,
+          "redirectUris": ["*"],
+          "webOrigins": ["*"]
+        },
+        {
+          "clientId": "nifi",
+          "enabled": true,
+          "protocol": "openid-connect",
+          "clientAuthenticatorType": "client-secret",
+          "secret": "nifi-client-secret",
+          "standardFlowEnabled": true,
+          "publicClient": false,
+          "redirectUris": ["*"],
+          "webOrigins": ["*"]
+        },
+        {
+          "clientId": "user-info-fetcher",
+          "enabled": true,
+          "protocol": "openid-connect",
+          "clientAuthenticatorType": "client-secret",
+          "secret": "user-info-fetcher-client-secret",
+          "serviceAccountsEnabled": true,
+          "standardFlowEnabled": false,
+          "publicClient": false
+        }
+      ]
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keycloak
+  labels:
+    app: keycloak
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: keycloak
+  template:
+    metadata:
+      labels:
+        app: keycloak
+    spec:
+      containers:
+        - name: keycloak
+          image: quay.io/keycloak/keycloak:26.0.7
+          args:
+            - start-dev
+            - --import-realm
+            - --https-certificate-file=/tls/tls.crt
+            - --https-certificate-key-file=/tls/tls.key
+          env:
+            # Bootstrap administrator of the Keycloak instance itself (the
+            # `master` realm), not of the `sdp` realm. Used to manage clients
+            # and users through the admin console.
+            - name: KC_BOOTSTRAP_ADMIN_USERNAME
+              value: admin
+            - name: KC_BOOTSTRAP_ADMIN_PASSWORD
+              value: admin
+            # The single externally valid address, see the header note. Every
+            # URL in the discovery document is built from this.
+            - name: KC_HOSTNAME
+              value: CHANGEME-KEYCLOAK-URL
+            # Behind a TLS-terminating load balancer the connection Keycloak
+            # sees is plain HTTP on an internal address. Without this it builds
+            # its URLs from that, and every redirect goes somewhere the browser
+            # cannot reach. Only set this where a proxy is actually in front:
+            # it makes Keycloak trust X-Forwarded-* from whoever connects.
+            - name: KC_PROXY_HEADERS
+              value: xforwarded
+            # Whether the token and userinfo endpoints Keycloak ADVERTISES come
+            # from the incoming request rather than from KC_HOSTNAME.
+            #
+            #   true   reached directly - in-cluster clients hit the Service name
+            #          and get back endpoints they can use.
+            #   false  behind a load balancer. A request-derived endpoint takes
+            #          the proxy's Host header, which carries no port, so
+            #          anything not on 443 advertises unreachable backchannel
+            #          endpoints while the issuer stays correct. The login fails
+            #          at the last step with `invalid_token_response`.
+            #
+            # OPA's user-info fetcher is unaffected: it builds its own URLs from
+            # 20-opa.yaml rather than reading discovery.
+            - name: KC_HOSTNAME_BACKCHANNEL_DYNAMIC
+              value: "CHANGEME-KEYCLOAK-BACKCHANNEL-DYNAMIC"
+            - name: KC_DB
+              value: postgres
+            - name: KC_DB_URL
+              value: jdbc:postgresql://postgres:5432/keycloak
+            - name: KC_DB_USERNAME
+              valueFrom: {secretKeyRef: {name: keycloak-postgres-credentials, key: username}}
+            - name: KC_DB_PASSWORD
+              valueFrom: {secretKeyRef: {name: keycloak-postgres-credentials, key: password}}
+          ports:
+            - {name: https, containerPort: 8443}
+          readinessProbe:
+            httpGet: {path: /realms/sdp, port: 8443, scheme: HTTPS}
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 30
+          resources:
+            requests: {cpu: 300m, memory: 640Mi}
+            limits: {cpu: "2", memory: 1536Mi}
+          volumeMounts:
+            - {name: realm, mountPath: /opt/keycloak/data/import}
+            - {name: tls, mountPath: /tls}
+      volumes:
+        - name: realm
+          configMap:
+            name: keycloak-realm
+        - name: tls
+          ephemeral:
+            volumeClaimTemplate:
+              metadata:
+                annotations:
+                  secrets.stackable.tech/class: tls
+                  # `node` puts the node's IP in the SAN, which is what makes
+                  # https://<node-ip>:31443 verifiable.
+                  secrets.stackable.tech/scope: node,service=keycloak
+                  # A week rather than the default day: the pod is stamped with
+                  # the expiry and the restart-controller bounces it then, so
+                  # the default is a daily restart.
+                  secrets.stackable.tech/backend.autotls.cert.lifetime: 7d
+              spec:
+                accessModes: ["ReadWriteOnce"]
+                resources:
+                  requests:
+                    storage: "1"
+                storageClassName: secrets.stackable.tech
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak
+spec:
+  selector:
+    app: keycloak
+  ports:
+    - {name: https, port: 8443, targetPort: 8443}
+---
+# Fixed NodePort, because the address is baked into KC_HOSTNAME above and into
+# every AuthenticationClass. An operator-managed Listener would pick a port at
+# random and break that agreement on every re-create.
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak-external
+spec:
+  type: NodePort
+  selector:
+    app: keycloak
+  ports:
+    - {name: https, port: 8443, targetPort: 8443, nodePort: 31443}

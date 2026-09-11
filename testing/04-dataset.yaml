@@ -1,0 +1,57 @@
+####################################################################################
+# Uploads the test dataset into the object store. Local only.
+#
+# `data/customers.csv` lands at `s3://raw/customers/customers.csv`, which is
+# where the Spark ingest job in manifests/40-spark-jobs.yaml reads it from.
+#
+# The CSV itself is not embedded here. It is a real file in `data/` so it can be
+# edited and diffed like data rather than like YAML; `scripts/load-dataset.sh`
+# turns it into the ConfigMap `lakehouse-dataset` and then applies this file.
+# Applying this file on its own fails with an unmountable volume - run the
+# script, or `scripts/apply.sh`, which calls it.
+#
+# The upload uses the read-write identity, the same one Spark and the Hive
+# metastore use. The read-only identity cannot write here, which is the point of
+# having two.
+####################################################################################
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: dataset-upload
+spec:
+  backoffLimit: 10
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: mc
+          image: quay.io/minio/mc:RELEASE.2024-11-21T17-21-54Z
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              until mc alias set minio https://minio.CHANGEME-NAMESPACE.svc.cluster.local:9000 \
+                    "$ACCESS_KEY" "$SECRET_KEY"; do
+                echo "waiting for minio..."; sleep 3
+              done
+              mc cp /dataset/customers.csv minio/raw/customers/customers.csv
+              mc ls --recursive minio/raw
+          env:
+            - name: ACCESS_KEY
+              valueFrom: {secretKeyRef: {name: lakehouse-rw-credentials, key: accessKey}}
+            - name: SECRET_KEY
+              valueFrom: {secretKeyRef: {name: lakehouse-rw-credentials, key: secretKey}}
+          volumeMounts:
+            - {name: dataset, mountPath: /dataset}
+            # `mc` trusts any CA certificate it finds here. The ConfigMap comes
+            # from the TrustStore in manifests/03-truststore.yaml.
+            - {name: cluster-internal-ca, mountPath: /root/.mc/certs/CAs}
+      volumes:
+        - name: dataset
+          configMap:
+            name: lakehouse-dataset
+        - name: cluster-internal-ca
+          configMap:
+            name: cluster-internal-ca

@@ -1,0 +1,49 @@
+####################################################################################
+# Permissions for Airflow inside the namespace.
+#
+# The `airflow-serviceaccount` the operator creates may manage its own task pods
+# and nothing else. Submitting Spark jobs means creating SparkApplication
+# resources and following their status, so that is granted here.
+#
+# This is the technical identity of the load path: Airflow triggers Spark jobs as
+# itself, never on behalf of a user. No user credential is involved anywhere in
+# the chain, which is why a user's Trino permissions have no effect on what a DAG
+# can load. Nothing to fill in.
+#
+# NOTE - namespace-scoped (Role, not ClusterRole): Airflow can submit Spark jobs
+#   only into its own namespace.
+####################################################################################
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: airflow-spark-submit
+rules:
+  # Create and monitor Spark jobs.
+  - apiGroups: ["spark.stackable.tech"]
+    resources: ["sparkapplications"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: ["spark.stackable.tech"]
+    resources: ["sparkapplications/status"]
+    verbs: ["get", "list", "watch"]
+  # Read the driver pod's logs and follow pod events, so a failing Spark job
+  # shows up as a failing Airflow task with a usable message rather than as a
+  # timeout.
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: airflow-spark-submit
+subjects:
+  - kind: ServiceAccount
+    name: airflow-serviceaccount
+roleRef:
+  kind: Role
+  name: airflow-spark-submit
+  apiGroup: rbac.authorization.k8s.io

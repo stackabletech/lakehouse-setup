@@ -1,0 +1,106 @@
+####################################################################################
+# NiFi authorization policy.
+#
+# NiFi asks OPA for every resource access with a document describing the action
+# (`read` or `write`), the resource, and the authenticated identity, and expects
+# back an object shaped:
+#
+#   {"allowed": <bool>, "resourceNotFound": <bool>, "dumpCache": <bool>,
+#    "message": <string>}
+#
+# What the rules below produce:
+#
+#   NiFi nodes    full access. They authenticate to each other with certificates,
+#                 not as Keycloak users - see the note below.
+#   /admins       full access to everything, including the flow canvas,
+#                 controller settings and the NiFi REST API. `bob`.
+#   /analysts     read-only. They can open the canvas and inspect a flow, but
+#                 cannot start, stop or modify anything. `alice`.
+#   anyone else   nothing. `carol`.
+#
+# No values to fill in here.
+#
+# IMPORTANT - the `/proxy` grant for certificate identities is what makes a
+#   multi-node NiFi work at all. Node-to-node requests are proxied, and a node
+#   that may not use `/proxy` cannot forward them: the cluster forms and then
+#   every UI request fails. This setup runs a single node, where the rule is not
+#   yet load-bearing - which is exactly why it is easy to omit and then be
+#   surprised by on scale-out.
+#
+# IMPORTANT - the default answer is `resourceNotFound`, not `allowed: false`.
+#   That is what enables NiFi's policy inheritance: told the resource has no
+#   policy, NiFi retries against the parent resource. Returning `allowed: false`
+#   instead stops the walk, which is the right answer for a deliberate denial
+#   and the wrong one for "no opinion". Both appear below, used accordingly.
+#
+# NOTE - NiFi's own user-group provider is not configured here, so
+#   `input.identity.groups` is empty for OIDC logins. Group membership comes from
+#   the same OPA user-info lookup that Trino and Superset use, which keeps one
+#   source of truth for who is in which group.
+#
+# NOTE - read-only in NiFi means the UI still shows buttons that then fail. NiFi
+#   renders the canvas from what the user may read and does not grey out
+#   write actions the authorizer will refuse. That is NiFi behaviour, not a
+#   policy gap.
+####################################################################################
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nifi-policies
+  labels:
+    opa.stackable.tech/bundle: "true"
+data:
+  nifi_policies.rego: |
+    package nifi
+
+    # "No policy for this resource" - NiFi then asks about the parent resource.
+    default allow := {"resourceNotFound": true}
+
+    # A NiFi node authenticates with a certificate issued by the platform, so
+    # its identity is the certificate subject and never a Keycloak username.
+    # The user-info lookup below must not run for these.
+    is_node if startswith(input.identity.name, "CN=")
+
+    groups := {group |
+      not is_node
+      some group in data.stackable.opa.userinfo.v1.userInfoByUsername(input.identity.name).groups
+    }
+
+    # ── NiFi nodes ────────────────────────────────────────────────────────
+    allow := {"allowed": true} if is_node
+
+    # ── administrators ────────────────────────────────────────────────────
+    allow := {"allowed": true} if {
+      not is_node
+      "/admins" in groups
+    }
+
+    # ── analysts: read, and nothing else ──────────────────────────────────
+    allow := {"allowed": true} if {
+      not is_node
+      not "/admins" in groups
+      "/analysts" in groups
+      input.action.name == "read"
+    }
+
+    allow := {
+      "allowed": false,
+      "message": "read-only access: /analysts may not modify the flow",
+    } if {
+      not is_node
+      not "/admins" in groups
+      "/analysts" in groups
+      input.action.name != "read"
+    }
+
+    # ── everyone else ─────────────────────────────────────────────────────
+    # An explicit denial rather than `resourceNotFound`, so the decision log
+    # records the reason instead of a walk up the resource tree.
+    allow := {
+      "allowed": false,
+      "message": "no group grants access to NiFi",
+    } if {
+      not is_node
+      count(groups & {"/admins", "/analysts"}) == 0
+    }

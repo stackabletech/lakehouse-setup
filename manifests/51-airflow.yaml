@@ -1,0 +1,282 @@
+####################################################################################
+# Apache Airflow - orchestration.
+#
+# Executor: Kubernetes. Every task runs in its own pod, created on demand - no
+# message broker and no worker pool to size, so PostgreSQL is the only external
+# dependency. (Redis is needed only for the Celery executor.) Because task pods
+# are ephemeral, task logs must go to the object store or they die with the pod;
+# that is what the remote logging configuration below does.
+#
+# DAGs come from a git repository through git-sync, not from a ConfigMap. The
+# operator clones into an emptyDir and points AIRFLOW__CORE__DAGS_FOLDER and
+# PYTHONPATH at the checkout, so committing is the whole deployment procedure.
+# The four StatefulSet roles get a git-sync *sidecar* that keeps re-fetching;
+# KubernetesExecutor task pods get an *init container* instead, because a task
+# pod is shorter-lived than the sync period.
+#
+# Airflow submits Spark jobs through the Kubernetes API with its own service
+# account. The DAG and the SparkApplication in `dags/` are a worked example of
+# the load path, not a pipeline.
+#
+# ── FILL IN ──────────────────────────────────────────────────────────────────────
+#   CHANGEME-AIRFLOW-URL      Airflow's external origin, scheme included.
+#   CHANGEME-NAMESPACE        the namespace this is deployed into.
+#   CHANGEME-S3-ENDPOINT      the object store as a whole URL. Set from
+#                             S3_ENDPOINT and NOT derived from the namespace:
+#                             boto3 reads this connection string rather than the
+#                             S3Connection in 02-s3.yaml. apply.sh stops if the
+#                             two disagree.
+#   CHANGEME-DAGS-GIT-REPO    }  where the DAGs live, which branch, which
+#   CHANGEME-DAGS-GIT-BRANCH  }  subdirectory, and which CA signed the git
+#   CHANGEME-DAGS-GIT-FOLDER  }  server's certificate (`null` for plain http).
+#   CHANGEME-DAGS-GIT-TLS     }
+#
+# IMPORTANT - `tls` and the repository's scheme have to agree, and the operator
+#   checks it. An `http://` repository needs `tls: null`; `https://` needs a
+#   verification setting. Get it wrong and the operator refuses the whole cluster
+#   with `scheme does not match tls setting` - in its own log only. The object is
+#   accepted, `.status` stays empty, no Event is emitted and no StatefulSet is
+#   created, so it looks like nothing happened at all.
+#
+# IMPORTANT - a client-side `kubectl apply` deletes `tls: null` and the API
+#   server reapplies the CRD default, turning a correct manifest into the failure
+#   above. scripts/apply.sh uses `--server-side`; ArgoCD's default sync does not.
+#
+# NOTE - only the FIRST `dagsGitSync` entry is used. Further entries still get a
+#   sidecar and a volume each and are still cloned, but Airflow never reads them:
+#   the operator logs `Only the first one will be considered.` at WARN. Several
+#   repositories need Airflow's own DAG bundles instead.
+#
+# NOTE - the operator computes DAGS_FOLDER as
+#   `/stackable/app/git-0/current/<gitFolder>`. Do not set
+#   AIRFLOW__CORE__DAGS_FOLDER or PYTHONPATH in envOverrides: overrides merge
+#   last and would replace it with a path holding no DAGs.
+#
+# NOTE - git-sync exits after repeated fetch failures, taking the pod NotReady,
+#   and a task pod whose init container cannot clone never starts. An outage of
+#   the git server stops Airflow rather than leaving it on stale DAGs.
+#
+# NOTE - Airflow roles come from Keycloak groups through AUTH_ROLES_MAPPING
+#   below: `/admins` to Admin, `/analysts` to User. Anyone in neither lands on
+#   `Public`, which has no permissions - they reach the UI and see nothing, which
+#   is deliberate. Every user keeps `Public` in addition to any mapped role
+#   (`userRegistrationRole` is granted alongside the mapping, not instead of it),
+#   so never grant permissions to `Public`.
+#
+# NOTE - Airflow takes usernames from `preferred_username` and nothing else,
+#   hardcoded in the FAB provider's Keycloak branch. The `principalClaim` of the
+#   shared AuthenticationClass does not apply to it, so a different claim there
+#   makes Airflow disagree with the rest of the platform about who a user is.
+#
+# NOTE - `AIRFLOW__CORE__BASE_URL` is what the OIDC redirect URI is derived from.
+#   Pointed anywhere the browser cannot reach, login fails after the Keycloak
+#   redirect rather than before it, which looks like a Keycloak problem.
+####################################################################################
+---
+apiVersion: airflow.stackable.tech/v1alpha2
+kind: AirflowCluster
+metadata:
+  name: airflow
+spec:
+  image:
+    # Pinned deliberately. On 3.2.2 a scheduler killed mid-task crash-loops on
+    # its own orphaned-task cleanup and only a hand-edited metadata database
+    # recovers it; 3.1.6 recovers by itself. Repeat that test before raising it.
+    productVersion: 3.1.6
+  clusterConfig:
+    metadataDatabase:
+      postgresql:
+        host: postgres
+        port: 5432
+        database: airflow
+        credentialsSecretName: airflow-postgres-credentials
+    loadExamples: false
+    # Required field. The account it creates is a bootstrap credential - see the
+    # note at the Secret at the end of this file.
+    credentialsSecretName: airflow-admin-credentials
+    authentication:
+      - authenticationClass: keycloak
+        oidc:
+          clientCredentialsSecret: airflow-keycloak-client
+        # Users unknown to Airflow are created on first login...
+        userRegistration: true
+        # ...on a role with no permissions. AUTH_ROLES_MAPPING grants the real
+        # roles on top of this one, from Keycloak group membership.
+        userRegistrationRole: Public
+        # Re-read group membership on every login, not only at registration.
+        # Without this, a group change in Keycloak never reaches Airflow.
+        syncRolesAt: Login
+    # Where the DAGs come from. Point DAGS_GIT_* in config.env at the
+    # repository and fill in the `airflow-git-credentials` Secret from
+    # examples/external-credentials.yaml; nothing else in this file changes.
+    dagsGitSync:
+      - repo: CHANGEME-DAGS-GIT-REPO
+        branch: CHANGEME-DAGS-GIT-BRANCH
+        # The subdirectory of the repository that holds the DAGs. The rest of
+        # the repository is still cloned; Airflow just does not parse it.
+        gitFolder: CHANGEME-DAGS-GIT-FOLDER
+        # A shallow clone. DAG history is not something Airflow reads.
+        depth: 1
+        # How often the sidecar fetches. A new commit is live one period later,
+        # plus however long Airflow's dag processor takes to notice the file.
+        wait: 20s
+        # Keys `user` and `password`, handed to git-sync as GITSYNC_USERNAME
+        # and GITSYNC_PASSWORD. A GitHub or GitLab token goes in `password`.
+        credentials:
+          basicAuthSecretName: airflow-git-credentials
+        # See the two IMPORTANT notes in the header: this has to match the
+        # repository's scheme, and `null` survives only a server-side apply.
+        tls: CHANGEME-DAGS-GIT-TLS
+    volumes:
+      # The object store's CA. boto3 wants a file rather than a SecretClass, so
+      # this mounts the trust material directly instead of going through the
+      # secret-operator like every other consumer. It has to name the same CA
+      # that S3_CA does - nothing checks that the two agree.
+      - {name: cluster-internal-ca, CHANGEME-S3-CA-VOLUME}
+    volumeMounts:
+      - name: cluster-internal-ca
+        mountPath: /stackable/cluster-internal-ca
+  webservers:
+    roleConfig:
+      # External access is opt-in and outside manifests/: either
+      # examples/nodeports.yaml or examples/loadbalancer/.
+      listenerClass: cluster-internal
+    configOverrides:
+      # Appended verbatim to the generated webserver_config.py, so the value is
+      # Python. Keys are Keycloak group paths exactly as the `groups` claim
+      # reports them - full path, leading slash. `Op` and `Viewer` also exist,
+      # and a user in several mapped groups gets the union.
+      webserver_config.py:
+        AUTH_ROLES_MAPPING: '{"/admins": ["Admin"], "/analysts": ["User"]}'
+    config:
+      resources:
+        cpu: {min: 500m, max: "2"}
+        memory: {limit: 1536Mi}
+    envOverrides: &envOverrides
+      # AIRFLOW__CORE__DAGS_FOLDER and PYTHONPATH are deliberately absent: the
+      # operator derives both from dagsGitSync. See the header note.
+      #
+      # External identity of this Airflow, see the header note.
+      AIRFLOW__CORE__BASE_URL: "CHANGEME-AIRFLOW-URL"
+      # Trust the X-Forwarded-* headers of the proxy in front, so the scheme and
+      # host Airflow builds URLs from are the ones the browser used. Behind a
+      # TLS-terminating load balancer the pod only ever sees plain HTTP.
+      AIRFLOW__FAB__ENABLE_PROXY_FIX: "True"
+      # Lets DAGs talk to the Kubernetes API of the cluster they run in, which
+      # is how the Spark job is submitted.
+      AIRFLOW_CONN_KUBERNETES_IN_CLUSTER: "kubernetes://?__extra__=%7B%22extra__kubernetes__in_cluster%22%3A+true%2C+%22extra__kubernetes__kube_config%22%3A+%22%22%2C+%22extra__kubernetes__kube_config_path%22%3A+%22%22%2C+%22extra__kubernetes__namespace%22%3A+%22%22%7D"
+      # Task pods are ephemeral, so logs go to the object store.
+      AIRFLOW__LOGGING__REMOTE_LOGGING: "True"
+      AIRFLOW__LOGGING__REMOTE_LOG_CONN_ID: "s3_conn"
+      AIRFLOW__LOGGING__REMOTE_BASE_LOG_FOLDER: "s3://lakehouse/airflow-logs"
+    podOverrides: &podOverrides
+      spec:
+        containers:
+          - name: airflow
+            env: &s3env
+              - name: AWS_ACCESS_KEY_ID
+                valueFrom:
+                  secretKeyRef:
+                    name: lakehouse-rw-credentials
+                    key: accessKey
+              - name: AWS_SECRET_ACCESS_KEY
+                valueFrom:
+                  secretKeyRef:
+                    name: lakehouse-rw-credentials
+                    key: secretKey
+              # `verify` points at the CA mounted above. Without it boto3
+              # rejects the object store's certificate and every log upload
+              # fails silently - the task succeeds, the log is never there.
+              - name: AIRFLOW_CONN_S3_CONN
+                value: '{"conn_type": "aws", "extra": {"endpoint_url": "CHANGEME-S3-ENDPOINT", "region_name": "us-east-1", "verify": "/stackable/cluster-internal-ca/ca.crt"}}'
+        # Week-long certificates rather than the default day, so the
+        # restart-controller stops bouncing these four pods daily. Both volumes
+        # hold only a CA and no CRD field reaches either, hence the override.
+        # The empty `spec: {}` merges into the operator's own volume by name;
+        # naming one the operator did not create wedges it in a failing
+        # reconcile. See README.md, "How long certificates last".
+        volumes:
+          # The platform CA, mounted into every product pod.
+          - name: tls-ca-cert
+            ephemeral:
+              volumeClaimTemplate:
+                metadata:
+                  annotations:
+                    secrets.stackable.tech/backend.autotls.cert.lifetime: 7d
+                spec: {}
+          # The CA git-sync verifies the DAGs repository against - which the
+          # operator creates only when `dagsGitSync[].tls` names a SecretClass.
+          # With `webPki` or a plain `http://` repository there is no such
+          # volume, and an override naming one would be the wedge described
+          # above, so apply.sh substitutes this line away in those cases.
+          CHANGEME-DAGS-GIT-CA-VOLUME
+    roleGroups:
+      default:
+        replicas: 1
+  kubernetesExecutors:
+    config:
+      # Without this the operator gives every task pod 3Gi. Tasks here only
+      # create a SparkApplication and poll it, so the pod is a Python process
+      # with a Kubernetes client in it - and an oversized request is what makes
+      # a task sit in Pending on a node that has room for the work itself.
+      resources:
+        cpu: {min: 200m, max: "1"}
+        memory: {limit: 1Gi}
+    envOverrides: *envOverrides
+    podOverrides:
+      spec:
+        containers:
+          # In an executor pod the task container is called `base`, not
+          # `airflow`. Naming it `airflow` here silently applies nothing.
+          - name: base
+            env: *s3env
+  schedulers:
+    envOverrides: *envOverrides
+    podOverrides: *podOverrides
+    config:
+      resources:
+        cpu: {min: 300m, max: "2"}
+        memory: {limit: 1Gi}
+    roleGroups:
+      default:
+        replicas: 1
+  dagProcessors:
+    envOverrides: *envOverrides
+    podOverrides: *podOverrides
+    config:
+      resources:
+        cpu: {min: 200m, max: "1"}
+        memory: {limit: 768Mi}
+    roleGroups:
+      default:
+        replicas: 1
+  triggerers:
+    # The triggerer runs deferrable operators without occupying a task pod while
+    # they wait. Keep it - it is what stops the Spark-job sensor in the example
+    # DAG from holding a pod for the whole job.
+    envOverrides: *envOverrides
+    podOverrides: *podOverrides
+    config:
+      resources:
+        cpu: {min: 200m, max: "1"}
+        memory: {limit: 640Mi}
+    roleGroups:
+      default:
+        replicas: 1
+---
+# BOOTSTRAP CREDENTIAL - a required field, not a permanent account, and not
+# inert: Keycloak removes the password form from the login page, but
+# `POST /auth/token` still accepts these credentials with the Admin role. Use a
+# strong random password on anything but a test cluster, do not reuse it, and
+# keep it recorded - a fresh install against an empty database reuses it.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: airflow-admin-credentials
+type: Opaque
+stringData:
+  adminUser.username: admin
+  adminUser.firstname: Platform
+  adminUser.lastname: Administrator
+  adminUser.email: admin@stackable.test
+  adminUser.password: airflow-admin-password

@@ -1,0 +1,149 @@
+####################################################################################
+# PostgreSQL - metadata database stand-in. Local only.
+#
+# Four components keep durable state in a relational database. On a real cluster
+# these are your databases, possibly on separate servers; here one
+# PostgreSQL instance serves all four, one database each:
+#
+#   hive       Hive metastore - the Iceberg catalog
+#   airflow    Airflow metadata database
+#   superset   Superset metadata database
+#   keycloak   Keycloak realm, user and client storage
+#
+# One role per database, owning only its own database. That is the shape a DBA would
+# hand over, and it keeps a broken component from corrupting
+# another one's schema.
+#
+# Storage is an emptyDir: deleting the pod resets all four databases, including
+# every Superset dashboard and every Keycloak user created through the UI. The
+# realm in manifests/00-keycloak.yaml is re-imported on the next start, so the
+# accounts the setup ships with come back by themselves.
+####################################################################################
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-superuser
+stringData:
+  username: postgres
+  password: postgres
+---
+# One Secret per consumer. The operators read `username` and `password` from
+# these; the platform manifests reference them by name only, so replacing them
+# with External Secrets or similar needs no other change.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: hive-postgres-credentials
+type: Opaque
+stringData:
+  username: hive
+  password: hive-db-password
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: airflow-postgres-credentials
+type: Opaque
+stringData:
+  username: airflow
+  password: airflow-db-password
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: superset-postgres-credentials
+type: Opaque
+stringData:
+  username: superset
+  password: superset-db-password
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: keycloak-postgres-credentials
+type: Opaque
+stringData:
+  username: keycloak
+  password: keycloak-db-password
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init
+data:
+  # Everything in /docker-entrypoint-initdb.d runs once, on an empty data
+  # directory, as the superuser.
+  10-databases.sql: |
+    CREATE ROLE hive     WITH LOGIN PASSWORD 'hive-db-password';
+    CREATE ROLE airflow  WITH LOGIN PASSWORD 'airflow-db-password';
+    CREATE ROLE superset WITH LOGIN PASSWORD 'superset-db-password';
+    CREATE ROLE keycloak WITH LOGIN PASSWORD 'keycloak-db-password';
+
+    CREATE DATABASE hive     OWNER hive;
+    CREATE DATABASE airflow  OWNER airflow;
+    CREATE DATABASE superset OWNER superset;
+    CREATE DATABASE keycloak OWNER keycloak;
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: docker.io/library/postgres:16
+          env:
+            - name: POSTGRES_DB
+              value: postgres
+            - name: POSTGRES_USER
+              valueFrom: {secretKeyRef: {name: postgres-superuser, key: username}}
+            - name: POSTGRES_PASSWORD
+              valueFrom: {secretKeyRef: {name: postgres-superuser, key: password}}
+            # The image refuses to initdb into a non-empty mount root; a
+            # subdirectory avoids that on every volume type.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          args:
+            # Airflow's scheduler plus four dag-processor/triggerer/webserver
+            # pods and Superset's workers exhaust the default 100 connections.
+            - -c
+            - max_connections=300
+          ports:
+            - {name: postgres, containerPort: 5432}
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U $POSTGRES_USER -d $POSTGRES_DB"]
+            initialDelaySeconds: 5
+          resources:
+            requests: {cpu: 200m, memory: 256Mi}
+            limits: {cpu: "2", memory: 1Gi}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/postgresql/data}
+            - {name: init, mountPath: /docker-entrypoint-initdb.d}
+      volumes:
+        - name: data
+          emptyDir: {}
+        - name: init
+          configMap:
+            name: postgres-init
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+spec:
+  selector:
+    app: postgres
+  ports:
+    - {name: postgres, port: 5432, targetPort: 5432}

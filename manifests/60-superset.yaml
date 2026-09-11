@@ -1,0 +1,169 @@
+####################################################################################
+# Apache Superset - dashboards and SQL Lab over the lakehouse.
+#
+# Authentication is Keycloak OIDC. Authorization is OPA: the policy in
+# 23-opa-superset-policies.yaml maps Keycloak groups to Superset roles, and it is
+# consulted on every login.
+#
+# Superset reaches Trino through the Service name over HTTPS, verifying the
+# platform's internal CA. The connection itself is registered by the Job in
+# 61-superset-trino-connection.yaml, not here - Superset keeps database
+# connections in its metadata database, not in its configuration file.
+#
+# No values to fill in here.
+#
+# IMPORTANT - the OPA security manager REPLACES a user's roles on every
+#   successful login. Roles assigned in the Superset UI survive until that
+#   user's next login and then vanish. Manage access in Keycloak, not in
+#   Superset.
+#
+# IMPORTANT - `admin` from the credentials Secret below is a real account that
+#   does not go through Keycloak. It is needed to bootstrap Superset (the
+#   connection-registering Job authenticates as it), and it is what gets a
+#   platform back when Keycloak is unavailable. The OPA policy grants it Admin
+#   explicitly - the user-info lookup cannot resolve it, so without that rule it
+#   would log in with no roles at all.
+#
+# NOTE - the local login form is reachable at `/login/dblogin` and is what the
+#   `admin` account uses. The main login page shows only the Keycloak button.
+#   The custom view at the end of this file is what adds that second route;
+#   without it there is no way to use the bootstrap account through a browser.
+#
+# NOTE - the operator generates the Secret `superset-secret-key` itself; there
+#   is no field for it. That key encrypts stored database passwords, including
+#   Trino's, so deleting the Secret makes existing connections undecryptable and
+#   they have to be re-entered.
+####################################################################################
+---
+# BOOTSTRAP CREDENTIAL - see the header note. Not a permanent account.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: superset-admin-credentials
+type: Opaque
+stringData:
+  adminUser.username: admin
+  adminUser.firstname: Platform
+  adminUser.lastname: Administrator
+  adminUser.email: admin@stackable.test
+  adminUser.password: superset-admin-password
+---
+apiVersion: superset.stackable.tech/v1alpha1
+kind: SupersetCluster
+metadata:
+  name: superset
+spec:
+  image:
+    productVersion: 6.1.0
+  clusterConfig:
+    metadataDatabase:
+      postgresql:
+        host: postgres
+        port: 5432
+        database: superset
+        credentialsSecretName: superset-postgres-credentials
+    credentialsSecret: superset-admin-credentials
+    authentication:
+      - authenticationClass: keycloak
+        oidc:
+          clientCredentialsSecret: superset-keycloak-client
+          clientAuthenticationMethod: client_secret_basic
+        userRegistration: true
+        # Overridden by OPA on every login; this only decides what a brand-new
+        # user row is created with.
+        userRegistrationRole: Public
+        syncRolesAt: Login
+    authorization:
+      roleMappingFromOpa:
+        configMapName: opa
+        package: superset
+        cache:
+          entryTimeToLive: 30s
+          maxEntries: 10000
+  nodes:
+    roleConfig:
+      # External access is opt-in and outside manifests/: either
+      # examples/nodeports.yaml or examples/loadbalancer/.
+      listenerClass: cluster-internal
+    config:
+      resources:
+        cpu: {min: 500m, max: "2"}
+        memory: {limit: 1536Mi}
+    # Two things no CRD field reaches: the platform CA as a ConfigMap, which
+    # Superset's Trino driver reads as a file, and a week-long lifetime on the
+    # CA volume so the restart-controller stops bouncing this pod daily. The
+    # empty `spec: {}` merges into the operator's own volume by name; naming one
+    # the operator did not create wedges it in a failing reconcile. See
+    # README.md, "How long certificates last".
+    podOverrides:
+      spec:
+        containers:
+          - name: superset
+            volumeMounts:
+              - name: cluster-internal-ca
+                mountPath: /stackable/cluster-internal-ca
+        volumes:
+          - name: cluster-internal-ca
+            configMap:
+              name: cluster-internal-ca
+          - name: tls-ca-cert
+            ephemeral:
+              volumeClaimTemplate:
+                metadata:
+                  annotations:
+                    secrets.stackable.tech/backend.autotls.cert.lifetime: 7d
+                spec: {}
+    configOverrides:
+      superset_config.py:
+        # Appended verbatim to the generated superset_config.py, so this is
+        # Python. It adds a `/login/dblogin` route for the bootstrap account,
+        # on top of the OPA security manager the operator configures.
+        FILE_FOOTER: |
+          # Trust the X-Forwarded-* headers of the proxy in front. Behind a
+          # TLS-terminating load balancer Superset only sees plain HTTP, and
+          # without this it builds its OIDC redirect as http:// on an internal
+          # address. Harmless with nothing in front: absent headers change
+          # nothing.
+          ENABLE_PROXY_FIX = True
+
+          from flask import flash, g, redirect, request
+          from flask_appbuilder._compat import as_unicode
+          from flask_appbuilder.security.forms import LoginForm_db
+          from flask_appbuilder.security.views import AuthOAuthView, expose
+          from flask_appbuilder.utils.base import get_safe_redirect
+          from flask_login import login_user
+          from opa_authorizer.opa_manager import OpaSupersetSecurityManager
+
+
+          class OidcWithLocalLoginView(AuthOAuthView):
+              @expose("/dblogin/", methods=["GET", "POST"])
+              def dblogin(self):
+                  if g.user is not None and g.user.is_authenticated:
+                      return redirect(self.appbuilder.get_url_for_index)
+                  form = LoginForm_db()
+                  if form.validate_on_submit():
+                      next_url = get_safe_redirect(request.args.get("next", ""))
+                      user = self.appbuilder.sm.auth_user_db(
+                          form.username.data, form.password.data
+                      )
+                      if not user:
+                          flash(as_unicode(self.invalid_login_message), "warning")
+                          return redirect(request.url)
+                      login_user(user, remember=False)
+                      return redirect(next_url or self.appbuilder.get_url_for_index)
+                  return self.render_template(
+                      "appbuilder/general/security/login_db.html",
+                      title=self.title,
+                      form=form,
+                      appbuilder=self.appbuilder,
+                  )
+
+
+          class OidcOpaWithLocalLoginSecurityManager(OpaSupersetSecurityManager):
+              authoauthview = OidcWithLocalLoginView
+
+
+          CUSTOM_SECURITY_MANAGER = OidcOpaWithLocalLoginSecurityManager
+    roleGroups:
+      default:
+        replicas: 1

@@ -1,0 +1,243 @@
+####################################################################################
+# Forgejo - git server stand-in. Local only.
+#
+# Airflow reads its DAGs from a git repository through git-sync. On a real
+# cluster that repository is your own GitLab, Forgejo or GitHub; here
+# a single-pod Forgejo fills the role so the sync path can be exercised on
+# minikube.
+#
+# What matters for the test is the protocol, not the product: git over *smart
+# HTTPS* with basic auth, against a private repository, with a certificate from
+# an internal CA. That is the same path an in-cluster GitLab serves,
+# and it is what manifests/51-airflow.yaml is configured against.
+#
+# TLS comes from the platform's own CA through the secret-operator, the same way
+# testing/00-minio.yaml gets its certificate. The certificate is scoped
+# `node,service=forgejo`, so it is valid both for
+# `forgejo.<namespace>.svc.cluster.local` - which git-sync uses - and for the
+# node address behind the NodePort in testing/05-nodeports.yaml.
+#
+# The repository itself is created and filled by testing/03-dags-git.yaml.
+#
+# ── FILL IN ──────────────────────────────────────────────────────────────────────
+#   CHANGEME-NAMESPACE     the namespace this is deployed into.
+#   CHANGEME-FORGEJO-URL   the address a browser reaches Forgejo on, which is
+#                          what it builds links with. Derived by
+#                          scripts/resolve-config.sh from the node address and
+#                          the NodePort in testing/05-nodeports.yaml; there is
+#                          no entry in config.env because a stand-in only ever
+#                          exists on the local cluster.
+#
+# IMPORTANT - the admin account is created by an init container that writes
+#   `app.ini` itself, the way the upstream chart does it. Letting the image's
+#   entrypoint generate the file from environment variables and then creating
+#   the user in a `postStart` hook races with s6 startup, and the race is only
+#   lost occasionally.
+#
+# NOTE - a PersistentVolumeClaim, unlike the object store and the database next
+#   to it, which use emptyDir. Forgejo on an emptyDir loses the seeded
+#   repository on every rollout of this Deployment, and git-sync then reports
+#   `remote: Repository not found`, which is indistinguishable from an
+#   authentication failure in its log.
+#
+# NOTE - Forgejo rewrites `authorized_keys` on every start even with
+#   `DISABLE_SSH = true`, and the entrypoint does not create the directory it
+#   writes into. Without `/data/git/.ssh` the pod exits with
+#   `RewriteAllPublicKeys(ctx) failed: ... permission denied`.
+#
+# NOTE - `REQUIRE_SIGNIN_VIEW` is deliberately left off. Turning it on makes
+#   `/api/v1/version` answer 403, which fails the readiness probe below. The
+#   repository is private regardless, which is what the credential path needs.
+####################################################################################
+---
+# The account that owns the DAG repository. testing/03-dags-git.yaml pushes as
+# it, and Airflow reads as it - the same credential in both directions, because
+# a stand-in has no reason to model two.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: forgejo-admin
+type: Opaque
+stringData:
+  username: lakehouse
+  password: lakehouse-git-password
+---
+# The credential git-sync uses, in the shape the Airflow operator expects: keys
+# named `user` and `password`, handed to the sidecar as GITSYNC_USERNAME and
+# GITSYNC_PASSWORD. Referenced by name only from manifests/51-airflow.yaml, so
+# pointing Airflow at a real git server means replacing this Secret and nothing
+# else.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: airflow-git-credentials
+type: Opaque
+stringData:
+  user: lakehouse
+  password: lakehouse-git-password
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: forgejo-data
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: forgejo
+  labels:
+    app: forgejo
+spec:
+  replicas: 1
+  # The PVC is ReadWriteOnce, so a rolling update would deadlock on the volume.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: forgejo
+  template:
+    metadata:
+      labels:
+        app: forgejo
+    spec:
+      initContainers:
+        - name: init
+          image: &image codeberg.org/forgejo/forgejo:12.0.4
+          env:
+            - {name: GITEA_WORK_DIR, value: /data}
+            - {name: GITEA_CUSTOM, value: /data/gitea}
+            - {name: GITEA_APP_INI, value: /data/gitea/conf/app.ini}
+            - name: ADMIN_USER
+              valueFrom: {secretKeyRef: {name: forgejo-admin, key: username}}
+            - name: ADMIN_PASSWORD
+              valueFrom: {secretKeyRef: {name: forgejo-admin, key: password}}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+
+              # The secret-operator writes tls.crt and tls.key; Forgejo reads
+              # whatever CERT_FILE and KEY_FILE point at, but the web process
+              # runs as uid 1000 rather than root. Copy rather than mount so
+              # the key can be owned by that uid.
+              mkdir -p /certs
+              cp /stackable/tls/tls.crt /certs/cert.pem
+              cp /stackable/tls/tls.key /certs/key.pem
+              chown 1000:1000 /certs/cert.pem /certs/key.pem
+              chmod 0600 /certs/key.pem
+
+              mkdir -p /data/gitea/conf /data/git/repositories /data/git/.ssh /data/log
+              cat > /data/gitea/conf/app.ini <<'EOF'
+              APP_NAME = lakehouse DAG repository
+              RUN_MODE = prod
+              RUN_USER = git
+              WORK_PATH = /data
+
+              [server]
+              PROTOCOL  = https
+              HTTP_ADDR = 0.0.0.0
+              HTTP_PORT = 3000
+              CERT_FILE = /certs/cert.pem
+              KEY_FILE  = /certs/key.pem
+              DOMAIN    = forgejo.CHANGEME-NAMESPACE.svc.cluster.local
+              ROOT_URL  = CHANGEME-FORGEJO-URL
+              DISABLE_SSH  = true
+              OFFLINE_MODE = true
+
+              [database]
+              DB_TYPE = sqlite3
+              PATH    = /data/gitea/gitea.db
+
+              [security]
+              INSTALL_LOCK = true
+              # A test stand-in, so these are fixed rather than generated. On
+              # anything else Forgejo generates them into app.ini on first run.
+              SECRET_KEY     = lakehouse-forgejo-not-a-real-secret
+              INTERNAL_TOKEN = lakehouse-forgejo-not-a-real-token
+
+              [service]
+              DISABLE_REGISTRATION = true
+
+              [repository]
+              ROOT            = /data/git/repositories
+              DEFAULT_PRIVATE = private
+
+              [log]
+              MODE  = console
+              LEVEL = info
+              EOF
+
+              chown -R 1000:1000 /data
+              su-exec git forgejo migrate
+              # Idempotent: the pod restarts, the PVC does not reset.
+              su-exec git forgejo admin user create \
+                --admin --username "$ADMIN_USER" --password "$ADMIN_PASSWORD" \
+                --email "$ADMIN_USER@stackable.test" --must-change-password=false \
+                || echo "admin user already exists"
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: "1", memory: 512Mi}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+            - {name: certs, mountPath: /certs}
+            - {name: tls, mountPath: /stackable/tls}
+      containers:
+        - name: forgejo
+          image: *image
+          env:
+            - {name: USER_UID, value: "1000"}
+            - {name: USER_GID, value: "1000"}
+            - {name: GITEA_WORK_DIR, value: /data}
+            - {name: GITEA_CUSTOM, value: /data/gitea}
+            - {name: GITEA_APP_INI, value: /data/gitea/conf/app.ini}
+          ports:
+            - {name: https, containerPort: 3000}
+          readinessProbe:
+            httpGet: {path: /api/v1/version, port: 3000, scheme: HTTPS}
+            initialDelaySeconds: 5
+            periodSeconds: 3
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {cpu: "1", memory: 512Mi}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+            - {name: certs, mountPath: /certs}
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: forgejo-data
+        # Written by the init container, read by both.
+        - name: certs
+          emptyDir: {}
+        - name: tls
+          ephemeral:
+            volumeClaimTemplate:
+              metadata:
+                annotations:
+                  secrets.stackable.tech/class: tls
+                  secrets.stackable.tech/scope: node,service=forgejo
+                  # A week rather than the default day: the pod is stamped
+                  # with the expiry and the restart-controller bounces it
+                  # then, so the default is a daily restart.
+                  secrets.stackable.tech/backend.autotls.cert.lifetime: 7d
+              spec:
+                accessModes: ["ReadWriteOnce"]
+                resources:
+                  requests:
+                    storage: "1"
+                storageClassName: secrets.stackable.tech
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: forgejo
+spec:
+  selector:
+    app: forgejo
+  ports:
+    - {name: https, port: 3000, targetPort: 3000}

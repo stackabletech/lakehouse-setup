@@ -1,0 +1,21 @@
+####################################################################################
+# The platform's internal CA, published where ordinary containers can read it.
+#
+# The secret-operator hands certificates to pods through a CSI volume, which
+# suits the products but not a plain container that only needs to trust the CA -
+# `mc`, Airflow's S3 client, Superset's Trino driver. A TrustStore writes it into
+# an ordinary ConfigMap of the same name, holding `ca.crt`, mountable anywhere.
+#
+# Applied first, because the object store's init job already needs it.
+# Nothing to fill in.
+#
+# NOTE - a ConfigMap is the right place: this is a certificate, never a key.
+####################################################################################
+---
+apiVersion: secrets.stackable.tech/v1alpha1
+kind: TrustStore
+metadata:
+  name: cluster-internal-ca
+spec:
+  secretClassName: tls
+  format: tls-pem

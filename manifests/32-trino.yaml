@@ -1,0 +1,239 @@
+####################################################################################
+# Trino - the query engine, and the only path by which a human reads the
+# lakehouse.
+#
+# Two authentication methods, both active. Keycloak OIDC for people, and two
+# static technical users for clients that cannot complete a browser flow:
+# `data-import` for the load path and scripted ETL, `superset` for Superset's
+# single connection. Their permissions are in 22-opa-trino-policies.yaml; no
+# human should use either.
+#
+# The OIDC method also covers a client that already holds a Keycloak access token
+# and sends it as `Authorization: Bearer ...`. Trino checks signature and issuer,
+# reads the username from the principal claim, and authorizes through OPA like
+# any other login. Nothing extra to configure.
+#
+# Authorization: every access decision goes to OPA, column masks and row filters
+# included. Resource groups cap concurrency so one consumer cannot starve the
+# cluster - see the ConfigMap below.
+#
+# Nothing to fill in. The two technical users' passwords are at the end of this
+# file; change them before this leaves a test cluster.
+#
+# IMPORTANT - `enableColumnMasking` is what activates the `columns` entries in
+#   the OPA policy. Without it Trino never asks about column masks and the policy
+#   silently degrades to plain table access. Nothing warns about this.
+#
+# IMPORTANT - the coordinator's certificate is Service-scoped, so through the
+#   NodePort in examples/nodeports.yaml it does not cover the address and a
+#   browser warns. That is the local access path, not the setup: behind a real
+#   ingress the warning is gone, and in-cluster clients use the Service name and
+#   do verify.
+#
+# NOTE - changing the static user Secret needs a coordinator restart; the
+#   password database is generated at startup, not read per request.
+#
+# NOTE - resource groups go through a podOverride because the operator has no
+#   first-class field for them yet. The mechanism is stable: the file is mounted
+#   into the directory Trino reads its configuration from.
+####################################################################################
+---
+# Resource group definitions (concurrency and queueing limits).
+#
+# `global` is the root and contains three leaf groups. Trino refuses to run a
+# query directly in a non-leaf group, so every selector must target a leaf.
+#
+#   global.default    normal traffic. Generous limits.
+#   global.dashboard  client source `superset`. Dashboards fire many small
+#                     queries at once; the cap keeps a refreshing dashboard from
+#                     filling the cluster.
+#   global.batch      the load path (`source=batch`). One running, one queued,
+#                     further queries rejected with QUERY_QUEUE_FULL rather
+#                     than queued indefinitely.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trino-resource-groups
+data:
+  resource-groups.properties: |
+    resource-groups.configuration-manager=file
+    resource-groups.config-file=/stackable/resource-groups/resource-groups.json
+  # Strict JSON - a comment or an unknown key prevents the coordinator starting.
+  resource-groups.json: |
+    {
+      "rootGroups": [
+        {
+          "name": "global",
+          "softMemoryLimit": "100%",
+          "hardConcurrencyLimit": 100,
+          "maxQueued": 1000,
+          "subGroups": [
+            {
+              "name": "default",
+              "softMemoryLimit": "100%",
+              "hardConcurrencyLimit": 100,
+              "maxQueued": 1000
+            },
+            {
+              "name": "dashboard",
+              "softMemoryLimit": "50%",
+              "hardConcurrencyLimit": 10,
+              "maxQueued": 100
+            },
+            {
+              "name": "batch",
+              "softMemoryLimit": "30%",
+              "hardConcurrencyLimit": 1,
+              "maxQueued": 1
+            }
+          ]
+        }
+      ],
+      "selectors": [
+        {
+          "source": "superset",
+          "group": "global.dashboard"
+        },
+        {
+          "source": "batch",
+          "group": "global.batch"
+        },
+        {
+          "group": "global.default"
+        }
+      ]
+    }
+---
+apiVersion: trino.stackable.tech/v1alpha1
+kind: TrinoCluster
+metadata:
+  name: trino
+spec:
+  image:
+    productVersion: "481"
+  clusterConfig:
+    tls:
+      serverSecretClass: tls
+    catalogLabelSelector:
+      matchLabels:
+        trino: trino
+    authentication:
+      - authenticationClass: trino-technical-user
+      - authenticationClass: keycloak
+        oidc:
+          clientCredentialsSecret: trino-keycloak-client
+    authorization:
+      opa:
+        configMapName: opa
+        package: trino
+        # Required for the column masking rules in 22-opa-trino-policies.yaml.
+        enableColumnMasking: true
+  coordinators:
+    roleConfig:
+      # External access is opt-in and outside manifests/: either
+      # examples/nodeports.yaml or examples/loadbalancer/.
+      listenerClass: cluster-internal
+    configOverrides:
+      config.properties:
+        # Refresh tokens keep a browser session alive past the access token's
+        # lifetime, instead of bouncing the user back to Keycloak mid-session.
+        http-server.authentication.oauth2.refresh-tokens: "true"
+        # Build the OAuth2 redirect from the X-Forwarded-* headers rather than
+        # from the connection the coordinator sees. Required behind any
+        # TLS-terminating proxy: without it the redirect carries the internal
+        # address and scheme, and login fails AFTER the Keycloak round trip,
+        # which makes it look like a Keycloak problem.
+        #
+        # With nothing in front, no such headers arrive and Trino falls back to
+        # the real request, so this is harmless locally. It does mean Trino
+        # trusts those headers from whoever connects, so do not expose the
+        # coordinator directly to untrusted clients with this on.
+        http-server.process-forwarded: "true"
+    podOverrides:
+      spec:
+        containers:
+          - name: trino
+            volumeMounts:
+              - name: resource-groups
+                mountPath: /stackable/resource-groups
+              # Mounted as a single file into Trino's runtime config directory.
+              - name: resource-groups
+                mountPath: /stackable/rwconfig/resource-groups.properties
+                subPath: resource-groups.properties
+        volumes:
+          - name: resource-groups
+            configMap:
+              name: trino-resource-groups
+          # A week rather than the default day. The coordinator's own
+          # certificates already last 15 days, but this CA-only volume does not,
+          # and its expiry is what was bouncing the pod daily. The empty
+          # `spec: {}` merges into the operator's own volume by name; naming one
+          # the operator did not create wedges it in a failing reconcile.
+          - name: tls-ca-cert
+            ephemeral:
+              volumeClaimTemplate:
+                metadata:
+                  annotations:
+                    secrets.stackable.tech/backend.autotls.cert.lifetime: 7d
+                spec: {}
+    config:
+      queryMaxMemory: 1GB
+      resources:
+        cpu: {min: 500m, max: "3"}
+        memory: {limit: 2Gi}
+    roleGroups:
+      default:
+        replicas: 1
+  workers:
+    config:
+      # A week rather than the operator's default day. The operator already
+      # gives the coordinator 15 days because a restart there kills every
+      # running query; a worker restart kills the ones scheduled on it.
+      requestedSecretLifetime: 7d
+      resources:
+        cpu: {min: 500m, max: "3"}
+        memory: {limit: 2Gi}
+    # The CA-only volume the field above does not reach. Same reasoning as the
+    # coordinator override; see README.md, "How long certificates last".
+    podOverrides:
+      spec:
+        volumes:
+          - name: tls-ca-cert
+            ephemeral:
+              volumeClaimTemplate:
+                metadata:
+                  annotations:
+                    secrets.stackable.tech/backend.autotls.cert.lifetime: 7d
+                spec: {}
+    roleGroups:
+      default:
+        # One worker fits a laptop. A coordinator plus one worker already
+        # exercises distributed execution, so raising this is sizing, not
+        # function.
+        replicas: 1
+---
+# The static technical users. These are the only static credentials in the
+# platform: everything a human touches goes through Keycloak.
+apiVersion: authentication.stackable.tech/v1alpha1
+kind: AuthenticationClass
+metadata:
+  name: trino-technical-user
+spec:
+  provider:
+    static:
+      userCredentialsSecret:
+        name: trino-technical-user
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: trino-technical-user
+type: kubernetes.io/opaque
+stringData:
+  # The load path: Airflow-submitted Spark jobs and scripted ETL. The only
+  # identity allowed to write.
+  data-import: data-import-password
+  # Superset's single connection to Trino. Read-only, and deliberately given
+  # the same masked and row-filtered view as an analyst - the reasoning is in
+  # the header of 22-opa-trino-policies.yaml.
+  superset: superset-trino-password

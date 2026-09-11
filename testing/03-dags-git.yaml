@@ -1,0 +1,105 @@
+####################################################################################
+# Puts the DAGs into the git server. Local only.
+#
+# Creates a *private* repository in the Forgejo of testing/02-forgejo.yaml and
+# pushes the contents of `dags/` into a `dags/` subdirectory of it. That is what
+# `dagsGitSync` in manifests/51-airflow.yaml then clones.
+#
+# Applied by scripts/load-dags.sh rather than by scripts/apply.sh directly,
+# because the files it pushes come from `dags/` on disk: the script turns that
+# directory into the ConfigMap mounted below, the same way scripts/load-dataset.sh
+# turns `data/customers.csv` into one.
+#
+# ── FILL IN ──────────────────────────────────────────────────────────────────────
+#   CHANGEME-NAMESPACE   the namespace this is deployed into.
+#
+# IMPORTANT - the push is a single commit, forced. Re-running the Job makes the
+#   repository match `dags/` exactly, including deletions. Nothing here is a
+#   place to keep history - if you edit a DAG through the Forgejo UI, the next
+#   scripts/apply.sh overwrites it.
+#
+# NOTE - the repository is private, so an unauthenticated clone is refused and
+#   git-sync really does have to present the credential. That is the point:
+#   a public repository would let a broken `basicAuthSecretName` pass unnoticed.
+#
+# NOTE - Forgejo serves a certificate from the platform's own CA, which no
+#   container trusts by default. Both `curl` and `git` are pointed at the
+#   ConfigMap the TrustStore in manifests/03-truststore.yaml publishes.
+####################################################################################
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: dags-git-push
+spec:
+  backoffLimit: 10
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        # The Forgejo image, for no reason other than that it already contains
+        # git and curl and is already pulled onto the node.
+        - name: push
+          image: codeberg.org/forgejo/forgejo:12.0.4
+          env:
+            - name: GIT_USER
+              valueFrom: {secretKeyRef: {name: forgejo-admin, key: username}}
+            - name: GIT_PASSWORD
+              valueFrom: {secretKeyRef: {name: forgejo-admin, key: password}}
+            - {name: FORGEJO, value: "https://forgejo.CHANGEME-NAMESPACE.svc.cluster.local:3000"}
+            - {name: GIT_SSL_CAINFO, value: /stackable/cluster-internal-ca/ca.crt}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              CA=/stackable/cluster-internal-ca/ca.crt
+
+              echo "waiting for forgejo at $FORGEJO"
+              until curl -sf --cacert "$CA" "$FORGEJO/api/v1/version"; do sleep 3; done
+              echo
+
+              # 201 on the first run, 409 afterwards. Both are fine; the body
+              # is only interesting when it is neither.
+              echo "creating the repository"
+              CODE=$(curl -s -o /tmp/response -w '%{http_code}' \
+                --cacert "$CA" -u "$GIT_USER:$GIT_PASSWORD" \
+                -X POST "$FORGEJO/api/v1/user/repos" \
+                -H 'Content-Type: application/json' \
+                -d '{"name":"airflow-dags","private":true,"auto_init":false}')
+              echo "HTTP $CODE"
+              case "$CODE" in
+                201) echo "repository created, private" ;;
+                409) echo "repository already exists" ;;
+                *)   cat /tmp/response; echo; exit 1 ;;
+              esac
+
+              rm -rf /tmp/repo
+              mkdir -p /tmp/repo/dags
+              cp /dags-src/* /tmp/repo/dags/
+              cd /tmp/repo
+
+              git init -q -b main
+              git config user.name "$GIT_USER"
+              git config user.email "$GIT_USER@stackable.test"
+              git add -A
+              git commit -q -m "DAGs from the lakehouse-setup package"
+              git remote add origin \
+                "https://$GIT_USER:$GIT_PASSWORD@forgejo.CHANGEME-NAMESPACE.svc.cluster.local:3000/$GIT_USER/airflow-dags.git"
+              git push -q -u origin main --force
+
+              echo "pushed:"
+              git ls-tree -r --name-only HEAD
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: 500m, memory: 256Mi}
+          volumeMounts:
+            # Created by scripts/load-dags.sh from the `dags/` directory.
+            - {name: dags, mountPath: /dags-src}
+            - {name: cluster-internal-ca, mountPath: /stackable/cluster-internal-ca}
+      volumes:
+        - name: dags
+          configMap:
+            name: airflow-dags
+        - name: cluster-internal-ca
+          configMap:
+            name: cluster-internal-ca

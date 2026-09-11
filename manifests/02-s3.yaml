@@ -1,0 +1,123 @@
+####################################################################################
+# Object store connections.
+#
+# Two S3 identities over the same endpoint and the same bucket, on purpose:
+#
+#   lakehouse-ro   read-only     the analyst-facing Trino catalog.
+#                                An analyst write is refused by the object store
+#                                itself, not only by the policy engine.
+#   lakehouse-rw   read-write    the Hive metastore (it creates schema and table
+#                                directories), the Trino write catalog, Spark
+#                                loads, and Airflow's task-log upload.
+#
+# Only `host`, `port`, `region` and the two credential Secrets change between
+# environments. No product manifest names an endpoint directly, so this file is
+# the single place the object store is named.
+#
+# ── FILL IN ──────────────────────────────────────────────────────────────────────
+#   CHANGEME-NAMESPACE   the namespace this is deployed into.
+#
+# IMPORTANT - TLS is not optional. Trino 469 and later refuse an S3 connection
+#   without it, and the refusal happens in the operator: the TrinoCluster never
+#   reconciles and no coordinator pod is created, which looks like a stuck
+#   cluster rather than a configuration error.
+#
+# IMPORTANT - the CA below is a separate question from the platform's own. It is
+#   whatever signed the certificate at `host`, which for an object store outside
+#   the platform is not the platform CA. See S3_CA in config.env.
+#
+# IMPORTANT - `host` is the fully qualified Service name. A platform-issued
+#   Service-scoped certificate carries exactly one DNS name,
+#   `<service>.<namespace>.svc.cluster.local`, so a short name fails hostname
+#   verification. Outside the cluster this becomes the real hostname.
+#
+# IMPORTANT - `region` is part of the sigv4 signature and the three clients
+#   involved disagree on a default (Trino's own S3 client, Hadoop S3A for the
+#   metastore, Iceberg S3FileIO for Spark). Set it explicitly.
+#
+# IMPORTANT - the SecretClass label on each Secret is what binds it to its class.
+#   Dropping it does not error; it produces a volume mount that hangs.
+#
+# NOTE - no operator watches an S3Connection. After changing an endpoint, a CA or
+#   a credential, restart the consumers by hand: Hive metastore, Trino
+#   coordinator and workers, Airflow.
+####################################################################################
+---
+# Read-only - the analyst-facing Trino catalog.
+apiVersion: s3.stackable.tech/v1alpha1
+kind: S3Connection
+metadata:
+  name: lakehouse-ro
+spec:
+  host: minio.CHANGEME-NAMESPACE.svc.cluster.local
+  port: 9000
+  # Path style avoids depending on wildcard DNS for virtual-host addressing.
+  accessStyle: Path
+  region:
+    name: us-east-1
+  credentials:
+    secretClass: lakehouse-ro-credentials
+  tls:
+    verification:
+      server:
+        # Which CA signed the object store's certificate. See S3_CA in
+        # config.env.
+        CHANGEME-S3-CA
+---
+apiVersion: secrets.stackable.tech/v1alpha1
+kind: SecretClass
+metadata:
+  name: lakehouse-ro-credentials
+spec:
+  backend:
+    k8sSearch:
+      searchNamespace:
+        pod: {}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: lakehouse-ro-credentials
+  labels:
+    secrets.stackable.tech/class: lakehouse-ro-credentials
+stringData:
+  accessKey: lakehouse-ro
+  secretKey: lakehouse-ro-secret
+---
+# Read-write - Hive metastore, the Trino write catalog, Spark loads, Airflow logs.
+apiVersion: s3.stackable.tech/v1alpha1
+kind: S3Connection
+metadata:
+  name: lakehouse-rw
+spec:
+  host: minio.CHANGEME-NAMESPACE.svc.cluster.local
+  port: 9000
+  accessStyle: Path
+  region:
+    name: us-east-1
+  credentials:
+    secretClass: lakehouse-rw-credentials
+  tls:
+    verification:
+      server:
+        CHANGEME-S3-CA
+---
+apiVersion: secrets.stackable.tech/v1alpha1
+kind: SecretClass
+metadata:
+  name: lakehouse-rw-credentials
+spec:
+  backend:
+    k8sSearch:
+      searchNamespace:
+        pod: {}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: lakehouse-rw-credentials
+  labels:
+    secrets.stackable.tech/class: lakehouse-rw-credentials
+stringData:
+  accessKey: lakehouse-rw
+  secretKey: lakehouse-rw-secret

@@ -1,0 +1,99 @@
+####################################################################################
+# The PySpark scripts the load path runs.
+#
+# Mounted into the driver and executors by both submission paths:
+#   examples/spark-iceberg-job.yaml   submitted by hand with kubectl
+#   dags/spark_job.yaml               submitted by the example DAG, which reads
+#                                     it from the git checkout next to itself
+#
+# spark_ingest.py is the one that matters: it is the load path end to end - read
+# a source file from the object store with the read-write identity, write an
+# Iceberg table through the Hive metastore, read it back. Everything downstream
+# (Trino, the OPA policies, Superset) queries the table it produces.
+#
+# No values to fill in here.
+#
+# NOTE - the table it creates, `lakehouse.raw.customers`, is an example. It was
+#   verified against a synthetic CSV of 2000 generated rows; no real or personal
+#   data was involved. Point SOURCE and TABLE below at your own data, or replace
+#   this script entirely - nothing else in the platform depends on its contents,
+#   only the OPA policies in 22-opa-trino-policies.yaml name its columns.
+#
+# NOTE - this load path bypasses Trino and OPA entirely: the object store's
+#   permissions and the metastore are what constrain it. That is intended for a
+#   trusted load path, and it is the reason the read-only identity exists for
+#   everyone else.
+####################################################################################
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spark-jobs
+data:
+  spark_ingest.py: |
+    """Load the customer CSV from the object store into an Iceberg table.
+
+    The `lakehouse` catalog is configured by the sparkConf of the
+    SparkApplication that runs this script; it points at the same Hive
+    metastore Trino uses, which is what makes the result queryable there.
+    """
+    from pyspark.sql import SparkSession
+    from pyspark.sql.types import (
+        DateType,
+        DoubleType,
+        StringType,
+        StructField,
+        StructType,
+    )
+
+    SOURCE = "s3a://raw/customers/customers.csv"
+    TABLE = "lakehouse.raw.customers"
+
+    # Declared rather than inferred: inference costs an extra pass over the
+    # file and, worse, lets the table's schema change when the data does.
+    SCHEMA = StructType(
+        [
+            StructField("customer_id", StringType(), nullable=False),
+            StructField("full_name", StringType(), nullable=True),
+            StructField("email", StringType(), nullable=True),
+            StructField("region", StringType(), nullable=True),
+            StructField("signup_date", DateType(), nullable=True),
+            StructField("lifetime_value", DoubleType(), nullable=True),
+            StructField("segment", StringType(), nullable=True),
+        ]
+    )
+
+    spark = SparkSession.builder.appName("customer-ingest").getOrCreate()
+
+    source = spark.read.option("header", True).schema(SCHEMA).csv(SOURCE)
+    print(f"read {source.count()} rows from {SOURCE}")
+
+    spark.sql("CREATE NAMESPACE IF NOT EXISTS lakehouse.raw")
+
+    # Partitioned by region because that is the row-filter column in the OPA
+    # policy: an analyst restricted to EMEA then reads one partition instead of
+    # scanning the table and discarding rows.
+    spark.sql(
+        f"""
+        CREATE TABLE IF NOT EXISTS {TABLE} (
+            customer_id    string,
+            full_name      string,
+            email          string,
+            region         string,
+            signup_date    date,
+            lifetime_value double,
+            segment        string
+        )
+        USING iceberg
+        PARTITIONED BY (region)
+        """
+    )
+
+    # Replace rather than append, so re-running the job is idempotent instead of
+    # doubling the table. Iceberg makes this a single atomic commit.
+    source.writeTo(TABLE).overwritePartitions()
+
+    print(f"rows in {TABLE}:")
+    spark.sql(f"SELECT region, count(*) AS rows FROM {TABLE} GROUP BY region").show()
+
+    spark.stop()

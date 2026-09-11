@@ -1,0 +1,152 @@
+####################################################################################
+# Registers the Trino connection in Superset.
+#
+# Superset keeps database connections in its metadata database, not in its
+# configuration file, so there is no declarative way to define one. This Job
+# does it through the REST API, authenticating as the bootstrap `admin` account.
+#
+# It is idempotent: an existing connection with the same name is updated rather
+# than duplicated, so re-running scripts/apply.sh is safe.
+#
+# No values to fill in here.
+#
+# IMPORTANT - the connection uses the `superset` technical Trino user, which OPA
+#   gives the masked, row-filtered view of the lakehouse. Every Superset user
+#   shares this connection, including in SQL Lab. The reasoning, and what the
+#   alternative would cost, is in the header of 22-opa-trino-policies.yaml.
+#
+# IMPORTANT - `verify` points at the platform's internal CA, mounted into the
+#   Superset pods by 60-superset.yaml. It is the Superset pod that opens the
+#   connection, so the path has to exist there, not in this Job's container.
+#
+# NOTE - `source=superset` in the connection URL is what puts these queries into
+#   the `global.dashboard` resource group defined in 32-trino.yaml. Without it
+#   dashboards compete with the load path for the same slots.
+####################################################################################
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: superset-trino-connection-script
+data:
+  register_connection.py: |
+    """Create or update the `lakehouse` database connection in Superset."""
+    import json
+    import sys
+    import time
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    BASE = "http://superset-node:8088"
+    NAME = "lakehouse"
+    # The Trino coordinator's certificate carries its fully qualified Service
+    # name and nothing else, so that is what the connection has to use.
+    NAMESPACE = open(
+        "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+    ).read().strip()
+
+    username = open("/superset-credentials/adminUser.username").read().strip()
+    password = open("/superset-credentials/adminUser.password").read().strip()
+    trino_password = open("/trino-credentials/superset").read().strip()
+
+    uri = (
+        f"trino://superset:{trino_password}@"
+        f"trino-coordinator.{NAMESPACE}.svc.cluster.local:8443/lakehouse"
+        "?source=superset"
+    )
+    # Verified by the Superset pod, against the CA mounted there.
+    connect_args = {"http_scheme": "https", "verify": "/stackable/cluster-internal-ca/ca.crt"}
+
+
+    def call(method, path, token=None, csrf=None, cookie=None, body=None):
+        request = urllib.request.Request(f"{BASE}{path}", method=method)
+        request.add_header("Content-Type", "application/json")
+        if token:
+            request.add_header("Authorization", f"Bearer {token}")
+        if csrf:
+            request.add_header("X-CSRFToken", csrf)
+        if cookie:
+            request.add_header("Cookie", cookie)
+        data = json.dumps(body).encode() if body is not None else None
+        with urllib.request.urlopen(request, data) as response:
+            return json.loads(response.read() or b"{}"), response.headers
+
+
+    # Superset finishes its database migration well after the port opens.
+    for attempt in range(60):
+        try:
+            token = call(
+                "POST",
+                "/api/v1/security/login",
+                body={
+                    "username": username,
+                    "password": password,
+                    "provider": "db",
+                    "refresh": True,
+                },
+            )[0]["access_token"]
+            break
+        except (urllib.error.URLError, KeyError) as error:
+            print(f"waiting for superset ({error})")
+            time.sleep(5)
+    else:
+        sys.exit("superset did not become available")
+
+    body, headers = call("GET", "/api/v1/security/csrf_token/", token=token)
+    csrf = body["result"]
+    # The CSRF token is only accepted together with the session cookie it was
+    # issued with. Dropping the cookie yields a 400 that reads like a bad token.
+    cookie = headers.get("Set-Cookie", "").split(";")[0]
+
+    query = json.dumps({"filters": [{"col": "database_name", "opr": "eq", "value": NAME}]})
+    existing = call("GET", f"/api/v1/database/?q={urllib.parse.quote(query)}", token=token)[0]
+
+    payload = {
+        "database_name": NAME,
+        "sqlalchemy_uri": uri,
+        "expose_in_sqllab": True,
+        "allow_ctas": False,
+        "allow_cvas": False,
+        "allow_dml": False,
+        "extra": json.dumps({"engine_params": {"connect_args": connect_args}}),
+    }
+
+    if existing["count"]:
+        database_id = existing["result"][0]["id"]
+        call("PUT", f"/api/v1/database/{database_id}", token, csrf, cookie, payload)
+        print(f"updated database connection {NAME} (id {database_id})")
+    else:
+        result = call("POST", "/api/v1/database/", token, csrf, cookie, payload)[0]
+        print(f"created database connection {NAME} (id {result['id']})")
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: superset-trino-connection
+spec:
+  backoffLimit: 10
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: register
+          image: docker.io/library/python:3.12-slim
+          command: ["python", "-u", "/script/register_connection.py"]
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: "1", memory: 512Mi}
+          volumeMounts:
+            - {name: script, mountPath: /script}
+            - {name: superset-credentials, mountPath: /superset-credentials}
+            - {name: trino-credentials, mountPath: /trino-credentials}
+      volumes:
+        - name: script
+          configMap:
+            name: superset-trino-connection-script
+        - name: superset-credentials
+          secret:
+            secretName: superset-admin-credentials
+        - name: trino-credentials
+          secret:
+            secretName: trino-technical-user

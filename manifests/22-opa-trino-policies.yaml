@@ -1,0 +1,250 @@
+####################################################################################
+# Trino authorization policy - this is the file adapted per organisation.
+#
+# 21-opa-trino-regorules.yaml is the engine and is generic. This file is the
+# policy data: who may see what. Adapting the platform to real groups and tables
+# is editing the lists below, not rewriting the model.
+#
+# Trino asks OPA for every catalog, schema, table and column access. OPA resolves
+# the acting user's Keycloak groups through the user-info client in 20-opa.yaml,
+# then applies the FIRST matching rule in each list.
+#
+# Nothing to fill in: the rules are written against the groups in the shipped
+# realm (00-keycloak.yaml) and the test dataset. On `lakehouse.raw.customers`
+# they produce:
+#
+#   data-import  the load-path technical user. Full read and write, and the only
+#                identity that sees the write catalog at all.
+#   superset     the Superset technical user. Read-only, and masked and
+#                row-filtered exactly like an analyst - see below.
+#   /admins      everything, unmasked. `bob`.
+#   /analysts    EMEA rows only; `full_name` unreadable, `customer_id` hashed,
+#                `email` partially masked. `alice`.
+#   anyone else  authenticates, then sees nothing. `carol` is the test.
+#
+# Everyone except `superset` also reads `tpch`, which is generated data with
+# nothing to protect. It is there as a diagnostic.
+#
+# IMPORTANT - why `superset` gets the analyst view rather than an admin one.
+#   Superset holds one connection and uses it for every user, charts, dashboards
+#   and SQL Lab alike, so Trino sees "superset" and never the person behind the
+#   request. On an unmasked connection any Superset user with SQL Lab could read
+#   unmasked data whatever their Keycloak groups - the rules in 23-* control
+#   which Superset features they get, not which rows Trino returns. Pinning the
+#   connection to the most restrictive view closes that gap, at the cost of an
+#   administrator seeing masked data in Superset and querying Trino directly for
+#   the rest.
+#
+#   The alternative is passing each user's Keycloak token through to Trino, which
+#   does accept a bearer token in place of a login. That needs a
+#   `DB_CONNECTION_MUTATOR` in the Superset configuration pulling the token out
+#   of the session, and makes every dashboard's result depend on who is looking.
+#   Not configured here.
+#
+# IMPORTANT - rule order matters. The engine applies the first matching rule and
+#   takes privileges, row filter and column masks all from that ONE rule. The
+#   table-specific `/analysts` rule is therefore listed BEFORE the schema-wide
+#   one; reversed, the broader rule shadows it and the masks silently do not
+#   apply - invisible until someone reads data they should not have seen.
+#
+# IMPORTANT - anything not matched is denied. There is no implicit allow, which
+#   is why `carol` ends up with nothing rather than everything.
+#
+# IMPORTANT - group paths are full Keycloak paths with a leading slash. Under AD
+#   or LDAP federation the federation mapper produces them - read them off a real
+#   token or user-info response rather than assuming.
+#
+# NOTE - `data-import` is a static Trino credential, not a Keycloak account. Make
+#   sure no human account in the realm ever carries that username: the policies
+#   match on the name, not on where it came from.
+####################################################################################
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trino-policies
+  labels:
+    opa.stackable.tech/bundle: "true"
+data:
+  trino_policies.rego: |
+    package trino_policies
+
+    # The restricted view of `lakehouse.raw.customers`, defined once and applied
+    # to two identities: the `/analysts` group and the `superset` technical user.
+    # One definition is what stops the two drifting apart and silently widening
+    # what Superset can read.
+    #
+    # The row filter is any SQL boolean over the table's columns, evaluated by
+    # Trino. For columns, `allow: false` refuses the column outright with
+    # PERMISSION_DENIED - stronger than a NULL, which still says the column
+    # exists and is empty - and `mask` is a SQL expression replacing the value,
+    # which may reference the column being masked.
+    customer_row_filter := "region = 'EMEA'"
+
+    customer_column_masks := [
+      {"name": "full_name", "allow": false},
+      {
+        "name": "customer_id",
+        "mask": "'sha256:' || to_hex(sha256(to_utf8(customer_id)))",
+      },
+      {
+        "name": "email",
+        "mask": "regexp_replace(email, '([^@]{1,3})([^@]+)@', '$1---@')",
+      },
+    ]
+
+    policies := {
+      "catalogs": [
+        # ── technical user ──────────────────────────────────────────────
+        {
+          "user": "data-import",
+          "catalog": "lakehouse|lakehousewrite|system|tpch",
+          "allow": "all",
+        },
+        # ── Superset's technical user ───────────────────────────────────
+        {
+          "user": "superset",
+          "catalog": "lakehouse|system",
+          "allow": "read-only",
+        },
+        # ── people ──────────────────────────────────────────────────────
+        # No rule grants anyone but `data-import` the write catalog, so it does
+        # not even appear in a SHOW CATALOGS for anybody else.
+        #
+        # `system` is required by JDBC and ODBC clients - Superset included -
+        # for metadata lookups. Without it a connection test fails before any
+        # query runs.
+        {
+          "group": "/admins|/analysts",
+          "catalog": "lakehouse|system|tpch",
+          "allow": "read-only",
+        },
+      ],
+      "schemas": [
+        # Only the technical user owns schemas; nobody else creates them.
+        {
+          "user": "data-import",
+          "catalog": "lakehouse|lakehousewrite",
+          "owner": true,
+        },
+      ],
+      "tables": [
+        # ── technical user ──────────────────────────────────────────────
+        {
+          "user": "data-import",
+          "catalog": "lakehouse|lakehousewrite",
+          "privileges": ["SELECT", "INSERT", "DELETE", "UPDATE", "OWNERSHIP", "GRANT_SELECT"],
+        },
+
+        # ── the restricted view ─────────────────────────────────────────
+        # Both entries are listed BEFORE the schema-wide grants further down,
+        # on purpose - see the rule-order note in the header.
+        {
+          "user": "superset",
+          "catalog": "lakehouse",
+          "schema": "raw",
+          "table": "customers",
+          "privileges": ["SELECT"],
+          "filter": customer_row_filter,
+          "columns": customer_column_masks,
+        },
+        {
+          "group": "/analysts",
+          "catalog": "lakehouse",
+          "schema": "raw",
+          "table": "customers",
+          "privileges": ["SELECT"],
+          "filter": customer_row_filter,
+          "columns": customer_column_masks,
+        },
+
+        # ── baseline read access ────────────────────────────────────────
+        {
+          "group": "/admins",
+          "catalog": "lakehouse",
+          "privileges": ["SELECT"],
+        },
+        {
+          "user": "superset",
+          "catalog": "lakehouse",
+          "schema": "raw",
+          "privileges": ["SELECT"],
+        },
+        {
+          "group": "/analysts",
+          "catalog": "lakehouse",
+          "schema": "raw",
+          "privileges": ["SELECT"],
+        },
+
+        # `tpch` is generated data with nothing to protect. It is the
+        # diagnostic catalog: a query against it that works while a lakehouse
+        # query fails separates "Trino is broken" from "the lakehouse is
+        # broken".
+        {
+          "user": "data-import",
+          "catalog": "tpch",
+          "privileges": ["SELECT"],
+        },
+        {
+          "group": "/admins|/analysts",
+          "catalog": "tpch",
+          "privileges": ["SELECT"],
+        },
+
+        # Required by JDBC and ODBC clients for metadata lookups.
+        {
+          "user": "superset",
+          "catalog": "system",
+          "schema": "jdbc|metadata",
+          "privileges": ["SELECT"],
+        },
+        {
+          "group": "/admins|/analysts",
+          "catalog": "system",
+          "schema": "jdbc|metadata",
+          "privileges": ["SELECT"],
+        },
+      ],
+      "system_information": [],
+      "queries": [
+        # Every user may view and cancel their own queries, and nobody else's.
+        {
+          "allow": ["execute"],
+        },
+      ],
+      # No user may act on behalf of another.
+      "impersonation": [],
+      "authorization": [],
+      "system_session_properties": [
+        {"allow": true},
+      ],
+      "catalog_session_properties": [
+        {"allow": true},
+      ],
+      "functions": [
+        # SELECT-side function use, including the built-in table functions
+        # Superset's metadata queries rely on.
+        {
+          "privileges": ["EXECUTE", "GRANT_EXECUTE"],
+        },
+      ],
+      "procedures": [],
+    }
+
+    # Resolves the acting user's group memberships through the OPA
+    # user-info-fetcher sidecar, which queries the Keycloak admin API.
+    # Configured in 20-opa.yaml. Do not change.
+    extra_groups := groups if {
+      request := {
+        "method": "POST",
+        "url": "http://127.0.0.1:9476/user",
+        "headers": {"Content-Type": "application/json"},
+        "body": {"username": input.context.identity.user},
+      }
+      response := http.send(request)
+
+      response.status_code == 200
+
+      groups := response.body.groups
+    }

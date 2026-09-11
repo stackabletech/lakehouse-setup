@@ -1,0 +1,172 @@
+####################################################################################
+# MinIO - object store stand-in. Local only.
+#
+# The platform needs an S3-compatible object store. On a real cluster that is
+# yours; here MinIO fills the role so the setup can be
+# exercised end to end on minikube.
+#
+# TLS is not optional: Trino 469 and later refuse an S3 connection without it.
+# The certificate comes from the platform's own CA, through the same
+# secret-operator mechanism the products use, so nothing external is needed.
+#
+# MinIO wants its certificate as `public.crt` and `private.key` in a directory it
+# is pointed at, while the secret-operator writes `tls.crt` and `tls.key`. The
+# command below copies them across before starting the server. An init container
+# would work too; this keeps it to one place.
+#
+# The certificate is scoped to the Service, so it is valid for
+# `minio.<namespace>.svc.cluster.local` and NOT for the short name `minio`.
+# That is why manifests/02-s3.yaml addresses it by its fully qualified name.
+#
+# Two buckets:
+#   lakehouse   Iceberg warehouse (`warehouse/`) and Airflow task logs
+#               (`airflow-logs/`)
+#   raw         landing zone for source files; the test dataset is uploaded here
+#
+# Two users beyond the root account, mirroring the least-privilege split the
+# platform expects:
+#   lakehouse-rw   read-write   Hive metastore, Spark loads, the Trino write
+#                               catalog, Airflow log upload
+#   lakehouse-ro   read-only    the analyst-facing Trino catalog. An analyst
+#                               write is refused by the object store itself,
+#                               not only by the policy engine.
+#
+# Storage is an emptyDir: deleting the pod deletes the lakehouse. That is
+# deliberate for a test setup - re-running scripts/apply.sh rebuilds it.
+####################################################################################
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: minio-root
+stringData:
+  rootUser: admin
+  rootPassword: adminadmin
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  labels:
+    app: minio
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: minio
+  template:
+    metadata:
+      labels:
+        app: minio
+    spec:
+      containers:
+        - name: minio
+          image: quay.io/minio/minio:RELEASE.2024-12-18T13-15-44Z
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              mkdir -p /certs
+              cp /stackable/tls/tls.crt /certs/public.crt
+              cp /stackable/tls/tls.key /certs/private.key
+              exec minio server /data \
+                --address :9000 --console-address :9001 --certs-dir /certs
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom: {secretKeyRef: {name: minio-root, key: rootUser}}
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom: {secretKeyRef: {name: minio-root, key: rootPassword}}
+          ports:
+            - {name: http, containerPort: 9000}
+            - {name: http-console, containerPort: 9001}
+          readinessProbe:
+            httpGet: {path: /minio/health/ready, port: 9000, scheme: HTTPS}
+            initialDelaySeconds: 5
+          resources:
+            requests: {cpu: 200m, memory: 512Mi}
+            limits: {cpu: "2", memory: 2Gi}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+            - {name: tls, mountPath: /stackable/tls}
+      volumes:
+        - name: data
+          emptyDir: {}
+        - name: tls
+          ephemeral:
+            volumeClaimTemplate:
+              metadata:
+                annotations:
+                  secrets.stackable.tech/class: tls
+                  secrets.stackable.tech/scope: node,service=minio
+                  # A week rather than the secret-operator's default day. The
+                  # restart-controller bounces the pod at the certificate's
+                  # expiry, and the `data` volume above is an emptyDir - so
+                  # on the default the buckets were emptied once a day.
+                  secrets.stackable.tech/backend.autotls.cert.lifetime: 7d
+              spec:
+                accessModes: ["ReadWriteOnce"]
+                resources:
+                  requests:
+                    storage: "1"
+                storageClassName: secrets.stackable.tech
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+spec:
+  selector:
+    app: minio
+  ports:
+    - {name: http, port: 9000, targetPort: 9000}
+    - {name: http-console, port: 9001, targetPort: 9001}
+---
+# Creates the buckets and the two scoped users. Re-runnable: every step either
+# ignores an existing object or overwrites it.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-init
+spec:
+  backoffLimit: 10
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: mc
+          image: quay.io/minio/mc:RELEASE.2024-11-21T17-21-54Z
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              until mc alias set minio https://minio.CHANGEME-NAMESPACE.svc.cluster.local:9000 \
+                    "$ROOT_USER" "$ROOT_PASSWORD"; do
+                echo "waiting for minio..."; sleep 3
+              done
+
+              mc mb --ignore-existing minio/lakehouse
+              mc mb --ignore-existing minio/raw
+
+              # readwrite and readonly are MinIO's built-in policies.
+              mc admin user add minio lakehouse-rw lakehouse-rw-secret
+              mc admin policy attach minio readwrite --user lakehouse-rw || true
+
+              mc admin user add minio lakehouse-ro lakehouse-ro-secret
+              mc admin policy attach minio readonly --user lakehouse-ro || true
+
+              mc ls minio
+              echo "minio initialised"
+          env:
+            - name: ROOT_USER
+              valueFrom: {secretKeyRef: {name: minio-root, key: rootUser}}
+            - name: ROOT_PASSWORD
+              valueFrom: {secretKeyRef: {name: minio-root, key: rootPassword}}
+          # `mc` trusts any CA certificate it finds here. The ConfigMap is
+          # produced by the TrustStore in manifests/03-truststore.yaml.
+          volumeMounts:
+            - {name: cluster-internal-ca, mountPath: /root/.mc/certs/CAs}
+      volumes:
+        - name: cluster-internal-ca
+          configMap:
+            name: cluster-internal-ca
