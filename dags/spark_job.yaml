@@ -1,18 +1,57 @@
 ####################################################################################
 # The SparkApplication that spark_ingest_dag.py submits.
 #
-# Not applied by scripts/apply.sh: the DAG reads this file from the checkout
-# next to itself and creates the resource through the Kubernetes API. It is a
-# copy of examples/spark-iceberg-job.yaml, which carries the comments explaining
-# each setting - keep the two in step, or delete whichever is unused.
+# The DAG reads this file from the checkout next to itself and creates the
+# resource through the Kubernetes API, with a unique name per run. Nothing
+# applies it directly.
 #
-# ── FILL IN ──────────────────────────────────────────────────────────────────────
-#   CHANGEME-NAMESPACE   the namespace this is deployed into. Unlike the files
-#                        in `manifests/`, this one is NOT substituted by
-#                        scripts/apply.sh - it never passes through it. Replace
-#                        the placeholder by hand before committing this file to
-#                        the DAG repository, along with the object store
-#                        endpoint, which is written out in full here.
+# Keep the `sparkConf` block as it is when copying this for another job: it is
+# what satisfies the platform's security requirements and what makes Spark and
+# Trino agree about where the data is. What changes per job is the script, the
+# resource sizing and the executor count.
+#
+# The security settings:
+#   spark.authenticate            mutual authentication between driver and
+#                                 executors. The operator generates the shared
+#                                 secret and delivers it to both.
+#   spark.network.crypto.enabled  AES-GCM encryption of the RPC channel and of
+#                                 block transfers between executors.
+#   spark.io.encryption.enabled   encryption of shuffle spill and other temporary
+#                                 data written to local disk.
+#   spark.ssl.ui.*                TLS for the Spark web UI, pinned to TLS 1.3,
+#                                 with a certificate issued by the platform.
+#
+# IMPORTANT - two different S3 clients are configured below, deliberately:
+#     spark.hadoop.fs.s3a.*   Hadoop S3A, used to READ source files. Only S3A can
+#                             read arbitrary files off the object store.
+#     spark.sql.catalog.*.s3  Iceberg's own S3FileIO, used to WRITE the table. It
+#                             speaks `s3://` natively, which is what Trino also
+#                             uses, so both address the same data the same way.
+#   Neither one covers both jobs. Removing either breaks half the script.
+#
+# IMPORTANT - `s3connection.reference` lets the operator mount the object store's
+#   CA into driver and executors. Do not set `-Djavax.net.ssl.trustStore` by
+#   hand instead: that replaces the JVM's system truststore, and dependency
+#   resolution over TLS then fails.
+#
+# IMPORTANT - `deps.packages` downloads the Iceberg libraries from Maven Central
+#   at job start. On a cluster without outbound access, point Spark at an
+#   internal mirror or use an image with the two JARs baked in and drop `deps`.
+#
+# NOTE - the object store endpoints are written out in full, with the namespace
+#   in them, because the certificate the object store presents is valid for that
+#   fully qualified name and for nothing shorter. `CHANGEME-NAMESPACE` is the
+#   namespace the platform runs in; it is filled in before this file is
+#   committed.
+#
+# NOTE - the credentials arrive as AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+#   environment variables from a Secret, which both S3 clients pick up from their
+#   default credential chain. That keeps them out of `sparkConf`, which is
+#   visible in the Spark UI.
+#
+# NOTE - the script this job runs comes from the ConfigMap `spark-jobs`, which
+#   the platform provides and mounts at /stackable/spark/jobs. Point
+#   `mainApplicationFile` and the `jobs` volume at your own script to change it.
 ####################################################################################
 ---
 apiVersion: spark.stackable.tech/v1alpha1
@@ -24,6 +63,8 @@ spec:
     productVersion: 4.1.2
   mode: cluster
   mainApplicationFile: local:///stackable/spark/jobs/spark_ingest.py
+  # Read-write identity. The operator also mounts this connection's CA into
+  # driver and executors.
   s3connection:
     reference: lakehouse-rw
   deps:
@@ -31,7 +72,7 @@ spec:
       - org.apache.iceberg:iceberg-spark-runtime-4.1_2.13:1.11.0
       - org.apache.iceberg:iceberg-aws-bundle:1.11.0
   sparkConf:
-    # See examples/spark-iceberg-job.yaml for what each of these does.
+    # ── security ────────────────────────────────────────────────────────────
     spark.authenticate: "true"
     spark.network.crypto.enabled: "true"
     spark.io.encryption.enabled: "true"
@@ -42,10 +83,12 @@ spec:
     spark.ssl.ui.keyStoreType: PKCS12
     spark.ssl.ui.protocol: TLSv1.3
 
+    # ── reading source files: Hadoop S3A ────────────────────────────────────
     spark.hadoop.fs.s3a.endpoint: https://minio.CHANGEME-NAMESPACE.svc.cluster.local:9000
     spark.hadoop.fs.s3a.endpoint.region: us-east-1
     spark.hadoop.fs.s3a.path.style.access: "true"
 
+    # ── writing Iceberg tables: the catalog over the Hive metastore ─────────
     spark.sql.extensions: org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
     spark.sql.catalog.lakehouse: org.apache.iceberg.spark.SparkCatalog
     spark.sql.catalog.lakehouse.type: hive
@@ -56,6 +99,7 @@ spec:
     spark.sql.catalog.lakehouse.s3.path-style-access: "true"
     spark.sql.catalog.lakehouse.client.region: us-east-1
 
+    # Credentials for both clients, from the platform's read-write Secret.
     spark.kubernetes.driver.secretKeyRef.AWS_ACCESS_KEY_ID: lakehouse-rw-credentials:accessKey
     spark.kubernetes.driver.secretKeyRef.AWS_SECRET_ACCESS_KEY: lakehouse-rw-credentials:secretKey
     spark.kubernetes.executor.secretKeyRef.AWS_ACCESS_KEY_ID: lakehouse-rw-credentials:accessKey
@@ -89,6 +133,7 @@ spec:
     - name: jobs
       configMap:
         name: spark-jobs
+    # Certificate for the Spark web UI, issued by the platform's internal CA.
     - name: tls
       ephemeral:
         volumeClaimTemplate:
@@ -97,10 +142,10 @@ spec:
               secrets.stackable.tech/class: tls
               secrets.stackable.tech/scope: pod
               secrets.stackable.tech/format: tls-pkcs12
-              # A week, matching the products. The load job finishes in minutes,
-              # so this is only insurance: the restart-controller deletes a pod
-              # at its certificate expiry, and for a driver pod that is the job
-              # failing rather than a restart.
+              # A week. The load job finishes in minutes, so this is only
+              # insurance: the platform deletes a pod at its certificate expiry,
+              # and for a driver pod that is the job failing rather than a
+              # restart.
               secrets.stackable.tech/backend.autotls.cert.lifetime: 7d
           spec:
             accessModes: ["ReadWriteOnce"]

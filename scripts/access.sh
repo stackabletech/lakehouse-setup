@@ -44,6 +44,19 @@ else
 commit is live one sync period later, plus the dag processor's own interval."
 fi
 
+# The dashboard exists only while the demo data case is applied.
+DEMO_LINES=""
+if [ "$DEMO_DATA" = true ]; then
+  DEMO_LINES="
+Demo data: \`lakehouse.demo.orders\`, 20 000 synthetic webshop orders, and the
+Superset dashboard \"Webshop orders\" at
+  http://$HOST:31082/superset/dashboard/webshop-orders/
+Every number on it is the EMEA-only, hashed view - the reasoning is in the
+header of demo/20-superset-dashboard.yaml. demo/WALKTHROUGH.md is the
+presenter's script.
+"
+fi
+
 cat <<EOF
 Namespace: $NAMESPACE
 Node:      $HOST
@@ -58,7 +71,7 @@ $STANDIN_LINES
 Airflow reads its DAGs from the repository at
   $DAGS_GIT_REPO
 on branch $DAGS_GIT_BRANCH, folder $DAGS_GIT_FOLDER. $DAG_DEPLOY
-
+$DEMO_LINES
 $CERT_WARNING
 internal CA, which browsers do not know. The warning is expected. NiFi's port is
 not fixed - it comes from its Listener, and it changes if that Listener is

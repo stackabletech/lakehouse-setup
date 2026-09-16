@@ -17,6 +17,10 @@
 #        triggers a run, which rewrites `lakehouse.raw.customers`. The Spark job
 #        replaces partitions rather than appending, so running it repeatedly
 #        leaves the same 2000 rows.
+#
+# NOTE - with DEMO_DATA true (the default) it also checks the demo data case:
+#        the table, its policy, and the dashboard. Those checks are skipped
+#        when the demo is switched off in config.env.
 
 set -euo pipefail
 
@@ -54,4 +58,5 @@ kubectl run smoke-test \
   --env "NAMESPACE=$NAMESPACE" \
   --env "KEYCLOAK_URL=$KEYCLOAK_URL" \
   --env "NIFI_URL=$NIFI_URL" \
+  --env "DEMO_DATA=$DEMO_DATA" \
   --command -- python3 -u - < "$ROOT/scripts/smoke_test.py"

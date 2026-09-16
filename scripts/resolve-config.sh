@@ -28,6 +28,11 @@ fi
 LOCAL_STANDINS="${_standins_override:-${LOCAL_STANDINS:-true}}"
 unset _standins_override
 
+# Whether to apply demo/ - the demo data case - on top of the platform. See
+# config.env. Independent of the stand-ins: a demo environment can run on real
+# infrastructure, and a local install can be a plain platform.
+DEMO_DATA="${DEMO_DATA:-true}"
+
 # Several defaults below are built from the namespace, so it comes first.
 # scripts/apply.sh sets it from its argument.
 NAMESPACE="${NAMESPACE:-lakehouse}"

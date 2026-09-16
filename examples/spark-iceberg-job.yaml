@@ -63,6 +63,11 @@
 #   in manifests/40-spark-jobs.yaml. Apply that first, or point
 #   `mainApplicationFile` and the `job` volume at your own script.
 #
+# NOTE - dags/spark_job.yaml is a copy of this job, kept there so the DAG
+#   repository is self-contained. That repository is what Airflow users see, so
+#   its comments name nothing outside dags/ - no file in this package. A change
+#   to the security or catalog settings here is a change there too.
+#
 # Run it with:
 #   kubectl apply -n <namespace> -f examples/spark-iceberg-job.yaml
 #   kubectl get sparkapplications -n <namespace> -w

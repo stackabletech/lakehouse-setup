@@ -1,0 +1,486 @@
+####################################################################################
+# The demo dashboard: "Webshop orders" in Superset, over `lakehouse.demo.orders`.
+#
+# Superset keeps datasets, charts and dashboards in its metadata database, so
+# like the Trino connection in manifests/61-* they are created through the REST
+# API by a Job, authenticating as the bootstrap `admin` account. One dataset,
+# four charts, one dashboard, and a permission grant that lets the analyst role
+# see it.
+#
+# It is idempotent: everything is looked up by name before it is created, and
+# updated in place when it exists, so re-running scripts/apply.sh refreshes the
+# dashboard to what this file says rather than duplicating it. Edits made in the
+# Superset UI to these objects are overwritten on the next run - copy a chart
+# before changing it.
+#
+# It waits for what it depends on rather than failing: the Trino connection
+# from 61-* has to be registered, and the table has to exist, which is the load
+# Job's work. Both come up in their own time on a cold cluster.
+#
+# No values to fill in.
+#
+# IMPORTANT - every number on this dashboard is the RESTRICTED view. Superset
+#   reaches Trino as the `superset` technical user, which demo/00-* row-filters
+#   to EMEA and hashes `customer_id`, whoever is looking - the reasoning is in
+#   the header of manifests/22-opa-trino-policies.yaml. The "top customers"
+#   table shows hashes on purpose: that is what the policy looks like from a
+#   dashboard. An administrator who wants the unfiltered numbers queries Trino
+#   directly, as `bob` does in the smoke test.
+#
+# IMPORTANT - `Gamma` is given `datasource access` on the demo dataset. Without
+#   it an analyst logs in and sees an empty dashboard list: Superset shows a
+#   dashboard only to users who may read every dataset on it. The grant is
+#   dataset-scoped, so it opens nothing else, and it survives the OPA role sync
+#   because that sync replaces a user's roles, not a role's permissions.
+#
+# NOTE - the charts carry their form data (`params`) and no saved query
+#   context. Superset builds the query when the dashboard renders, the same way
+#   it does for an imported chart, so nothing here depends on the shape of the
+#   query context, which changes between Superset versions.
+####################################################################################
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: demo-superset-dashboard-script
+data:
+  build_dashboard.py: |
+    """Create or update the demo dataset, charts and dashboard in Superset."""
+    import json
+    import sys
+    import time
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    BASE = "http://superset-node:8088"
+    DATABASE = "lakehouse"
+    SCHEMA = "demo"
+    TABLE = "orders"
+    DASHBOARD_TITLE = "Webshop orders"
+    DASHBOARD_SLUG = "webshop-orders"
+    ANALYST_ROLE = "Gamma"
+
+    username = open("/superset-credentials/adminUser.username").read().strip()
+    password = open("/superset-credentials/adminUser.password").read().strip()
+
+
+    def call(method, path, session=None, body=None):
+        """One API call. Returns (status, decoded body); never raises on HTTP status."""
+        request = urllib.request.Request(f"{BASE}{path}", method=method)
+        request.add_header("Content-Type", "application/json")
+        if session:
+            request.add_header("Authorization", f"Bearer {session['token']}")
+            request.add_header("X-CSRFToken", session["csrf"])
+            request.add_header("Cookie", session["cookie"])
+        data = json.dumps(body).encode() if body is not None else None
+        try:
+            with urllib.request.urlopen(request, data) as response:
+                return response.status, json.loads(response.read() or b"{}")
+        except urllib.error.HTTPError as error:
+            text = error.read().decode(errors="replace")
+            try:
+                return error.code, json.loads(text)
+            except ValueError:
+                return error.code, {"message": text[:300]}
+
+
+    def rison(value):
+        """A Rison string literal: quoted, with the two characters that need it escaped."""
+        return "'" + str(value).replace("!", "!!").replace("'", "!'") + "'"
+
+
+    def find(session, path, **filters):
+        """The objects at `path` whose columns equal the given values."""
+        clauses = ",".join(
+            f"(col:{column},opr:{operator},value:{rison(value)})"
+            for column, (operator, value) in filters.items()
+        )
+        query = urllib.parse.quote(f"(filters:!({clauses}),page_size:100)")
+        status, document = call("GET", f"{path}?q={query}", session)
+        if status != 200:
+            sys.exit(f"GET {path} failed: {status} {document}")
+        return document["result"]
+
+
+    def eq(value):
+        return ("eq", value)
+
+
+    def rel(value):
+        return ("rel_o_m", value)
+
+
+    def expect(status, document, what):
+        if status not in (200, 201):
+            sys.exit(f"{what} failed: {status} {document}")
+        return document
+
+
+    # ── login ────────────────────────────────────────────────────────────────
+    # Superset finishes its database migration well after the port opens.
+    for attempt in range(120):
+        status, document = call(
+            "POST",
+            "/api/v1/security/login",
+            body={
+                "username": username,
+                "password": password,
+                "provider": "db",
+                "refresh": True,
+            },
+        )
+        if status == 200:
+            token = document["access_token"]
+            break
+        print(f"waiting for superset ({status})")
+        time.sleep(5)
+    else:
+        sys.exit("superset did not become available")
+
+    request = urllib.request.Request(f"{BASE}/api/v1/security/csrf_token/")
+    request.add_header("Authorization", f"Bearer {token}")
+    with urllib.request.urlopen(request) as response:
+        csrf = json.loads(response.read())["result"]
+        # The CSRF token is only accepted together with the session cookie it
+        # was issued with.
+        cookie = response.headers.get("Set-Cookie", "").split(";")[0]
+    session = {"token": token, "csrf": csrf, "cookie": cookie}
+
+    # ── the database connection, registered by manifests/61-* ────────────────
+    deadline = time.time() + 1800
+    while True:
+        databases = find(session, "/api/v1/database/", database_name=eq(DATABASE))
+        if databases:
+            database_id = databases[0]["id"]
+            break
+        if time.time() > deadline:
+            sys.exit(f"the database connection {DATABASE} was never registered")
+        print(f"waiting for the {DATABASE} connection")
+        time.sleep(10)
+
+    # ── the dataset ──────────────────────────────────────────────────────────
+    # Creating it makes Superset read the table's columns through Trino, so it
+    # fails while the load Job has not created the table yet.
+    while True:
+        existing = find(
+            session,
+            "/api/v1/dataset/",
+            database=rel(database_id),
+            schema=eq(SCHEMA),
+            table_name=eq(TABLE),
+        )
+        if existing:
+            dataset_id = existing[0]["id"]
+            call("PUT", f"/api/v1/dataset/{dataset_id}/refresh", session)
+            print(f"dataset {SCHEMA}.{TABLE} exists (id {dataset_id}), columns refreshed")
+            break
+        status, document = call(
+            "POST",
+            "/api/v1/dataset/",
+            session,
+            {"database": database_id, "schema": SCHEMA, "table_name": TABLE},
+        )
+        if status == 201:
+            dataset_id = document["id"]
+            print(f"created dataset {SCHEMA}.{TABLE} (id {dataset_id})")
+            break
+        if time.time() > deadline:
+            sys.exit(f"could not create the dataset: {status} {document}")
+        print(f"waiting for the table {SCHEMA}.{TABLE} ({status})")
+        time.sleep(10)
+
+    # ── the dashboard, so the charts can be attached to it as they are made ──
+    existing = find(session, "/api/v1/dashboard/", slug=eq(DASHBOARD_SLUG))
+    if existing:
+        dashboard_id = existing[0]["id"]
+    else:
+        dashboard_id = expect(
+            *call(
+                "POST",
+                "/api/v1/dashboard/",
+                session,
+                {"dashboard_title": DASHBOARD_TITLE, "slug": DASHBOARD_SLUG, "published": False},
+            ),
+            "creating the dashboard",
+        )["id"]
+        print(f"created dashboard {DASHBOARD_SLUG} (id {dashboard_id})")
+
+    # ── the charts ───────────────────────────────────────────────────────────
+    revenue = {
+        "expressionType": "SIMPLE",
+        "column": {"column_name": "amount"},
+        "aggregate": "SUM",
+        "label": "Revenue",
+    }
+    no_time_filter = [
+        {
+            "expressionType": "SIMPLE",
+            "clause": "WHERE",
+            "subject": "order_date",
+            "operator": "TEMPORAL_RANGE",
+            "comparator": "No filter",
+        }
+    ]
+
+    # (name, viz_type, form data, width out of 12). Row breaks are below.
+    CHARTS = [
+        (
+            "Revenue",
+            "big_number_total",
+            {
+                "metric": revenue,
+                "adhoc_filters": no_time_filter,
+                "y_axis_format": "SMART_NUMBER",
+                "header_font_size": 0.4,
+                "subheader": "EMEA, as the shared connection sees it",
+                "subheader_font_size": 0.15,
+            },
+            3,
+        ),
+        (
+            "Orders",
+            "big_number_total",
+            {
+                "metric": "count",
+                "adhoc_filters": no_time_filter,
+                "y_axis_format": "SMART_NUMBER",
+                "header_font_size": 0.4,
+                "subheader_font_size": 0.15,
+            },
+            3,
+        ),
+        (
+            "Revenue by category",
+            "pie",
+            {
+                "groupby": ["category"],
+                "metric": revenue,
+                "adhoc_filters": no_time_filter,
+                "row_limit": 10,
+                "sort_by_metric": True,
+                "color_scheme": "supersetColors",
+                "show_legend": True,
+                "legendOrientation": "right",
+                "label_type": "key_percent",
+                "number_format": "SMART_NUMBER",
+                "show_labels": True,
+                "labels_outside": True,
+                "donut": True,
+                "innerRadius": 40,
+                "outerRadius": 70,
+            },
+            6,
+        ),
+        (
+            "Monthly revenue by region",
+            "echarts_timeseries_bar",
+            {
+                "x_axis": "order_date",
+                "time_grain_sqla": "P1M",
+                "metrics": [revenue],
+                "groupby": ["region"],
+                "adhoc_filters": no_time_filter,
+                "row_limit": 10000,
+                "color_scheme": "supersetColors",
+                "stack": "Stack",
+                "show_legend": True,
+                "legendOrientation": "top",
+                "x_axis_time_format": "smart_date",
+                "y_axis_format": "SMART_NUMBER",
+                "rich_tooltip": True,
+                "tooltipTimeFormat": "smart_date",
+                "only_total": True,
+                "truncateXAxis": True,
+                "y_axis_bounds": [None, None],
+            },
+            8,
+        ),
+        (
+            "Top customers",
+            "table",
+            {
+                "query_mode": "aggregate",
+                "groupby": ["customer_id"],
+                "metrics": [
+                    revenue,
+                    {
+                        "expressionType": "SIMPLE",
+                        "column": {"column_name": "order_id"},
+                        "aggregate": "COUNT",
+                        "label": "Orders",
+                    },
+                ],
+                "adhoc_filters": no_time_filter,
+                "timeseries_limit_metric": revenue,
+                "order_desc": True,
+                "row_limit": 10,
+                "server_page_length": 10,
+                "show_cell_bars": True,
+                "table_timestamp_format": "smart_date",
+            },
+            4,
+        ),
+    ]
+
+    chart_ids = {}
+    for name, viz_type, form_data, _ in CHARTS:
+        params = {
+            "datasource": f"{dataset_id}__table",
+            "viz_type": viz_type,
+            "extra_form_data": {},
+            **form_data,
+        }
+        body = {
+            "slice_name": name,
+            "viz_type": viz_type,
+            "datasource_id": dataset_id,
+            "datasource_type": "table",
+            "params": json.dumps(params),
+            "dashboards": [dashboard_id],
+        }
+        existing = find(session, "/api/v1/chart/", slice_name=eq(name))
+        if existing:
+            chart_id = existing[0]["id"]
+            expect(*call("PUT", f"/api/v1/chart/{chart_id}", session, body), f"updating chart {name}")
+            print(f"updated chart {name} (id {chart_id})")
+        else:
+            chart_id = expect(*call("POST", "/api/v1/chart/", session, body), f"creating chart {name}")["id"]
+            print(f"created chart {name} (id {chart_id})")
+        chart_ids[name] = chart_id
+
+    # ── the layout ───────────────────────────────────────────────────────────
+    # Superset's position tree: ROOT > GRID > ROW > CHART. Widths are twelfths
+    # of the grid; a row holds charts until its twelve columns are used up.
+    layout = {
+        "DASHBOARD_VERSION_KEY": "v2",
+        "ROOT_ID": {"type": "ROOT", "id": "ROOT_ID", "children": ["GRID_ID"]},
+        "GRID_ID": {"type": "GRID", "id": "GRID_ID", "children": [], "parents": ["ROOT_ID"]},
+        "HEADER_ID": {"type": "HEADER", "id": "HEADER_ID", "meta": {"text": DASHBOARD_TITLE}},
+    }
+    row, used = None, 12
+    for index, (name, _, _, width) in enumerate(CHARTS, start=1):
+        if used + width > 12:
+            row = f"ROW-{len(layout['GRID_ID']['children']) + 1}"
+            layout[row] = {
+                "type": "ROW",
+                "id": row,
+                "children": [],
+                "parents": ["ROOT_ID", "GRID_ID"],
+                "meta": {"background": "BACKGROUND_TRANSPARENT"},
+            }
+            layout["GRID_ID"]["children"].append(row)
+            used = 0
+        chart = f"CHART-{index}"
+        layout[chart] = {
+            "type": "CHART",
+            "id": chart,
+            "children": [],
+            "parents": ["ROOT_ID", "GRID_ID", row],
+            "meta": {"chartId": chart_ids[name], "sliceName": name, "width": width, "height": 50},
+        }
+        layout[row]["children"].append(chart)
+        used += width
+
+    expect(
+        *call(
+            "PUT",
+            f"/api/v1/dashboard/{dashboard_id}",
+            session,
+            {
+                "dashboard_title": DASHBOARD_TITLE,
+                "slug": DASHBOARD_SLUG,
+                "published": True,
+                "position_json": json.dumps(layout),
+                "json_metadata": json.dumps(
+                    {
+                        "color_scheme": "supersetColors",
+                        "refresh_frequency": 0,
+                        "cross_filters_enabled": True,
+                        "expanded_slices": {},
+                        "label_colors": {},
+                        "timed_refresh_immune_slices": [],
+                    }
+                ),
+            },
+        ),
+        "publishing the dashboard",
+    )
+    print(f"published dashboard {DASHBOARD_SLUG} with {len(CHARTS)} charts")
+
+    # ── access for analysts ──────────────────────────────────────────────────
+    # `datasource access` on this one dataset, added to the role OPA gives
+    # analysts (manifests/23-*). Looked up by name at every step, because the
+    # ids are assigned by the metadata database. The dataset's own resource is
+    # named `[<database>].[<table>](id:<dataset id>)` - older versions put the
+    # schema in front of the table, so it is matched on both ends rather than
+    # spelled out.
+    roles = find(session, "/api/v1/security/roles/", name=eq(ANALYST_ROLE))
+    resources = [
+        resource
+        for resource in find(
+            session, "/api/v1/security/resources/", name=("ew", f"](id:{dataset_id})")
+        )
+        if resource["name"].startswith(f"[{DATABASE}].[")
+    ]
+    permissions = find(session, "/api/v1/security/permissions/", name=eq("datasource_access"))
+    if not (len(roles) == 1 and len(resources) == 1 and len(permissions) == 1):
+        sys.exit(
+            f"could not resolve the grant: role {roles}, resource {resources}, "
+            f"permission {permissions}"
+        )
+    resource_name = resources[0]["name"]
+    grants = find(
+        session,
+        "/api/v1/security/permissions-resources/",
+        permission=rel(permissions[0]["id"]),
+        view_menu=rel(resources[0]["id"]),
+    )
+    if not grants:
+        sys.exit(f"no permission-resource pair for {resource_name}")
+    role_id, grant_id = roles[0]["id"], grants[0]["id"]
+
+    status, document = call("GET", f"/api/v1/security/roles/{role_id}/permissions/", session)
+    current = {entry["id"] for entry in expect(status, document, "reading role permissions")["result"]}
+    if grant_id in current:
+        print(f"{ANALYST_ROLE} already has {resource_name}")
+    else:
+        # The whole set is sent, so this is correct whether the endpoint adds to
+        # the role's permissions or replaces them.
+        expect(
+            *call(
+                "POST",
+                f"/api/v1/security/roles/{role_id}/permissions",
+                session,
+                {"permission_view_menu_ids": sorted(current | {grant_id})},
+            ),
+            "granting the role access",
+        )
+        print(f"granted {ANALYST_ROLE} datasource access on {resource_name}")
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: demo-superset-dashboard
+spec:
+  backoffLimit: 10
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: build
+          image: docker.io/library/python:3.12-slim
+          command: ["python", "-u", "/script/build_dashboard.py"]
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: "1", memory: 512Mi}
+          volumeMounts:
+            - {name: script, mountPath: /script}
+            - {name: superset-credentials, mountPath: /superset-credentials}
+      volumes:
+        - name: script
+          configMap:
+            name: demo-superset-dashboard-script
+        - name: superset-credentials
+          secret:
+            secretName: superset-admin-credentials

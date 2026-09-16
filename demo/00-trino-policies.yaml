@@ -1,0 +1,77 @@
+####################################################################################
+# Trino authorization for the demo tables.
+#
+# manifests/22-opa-trino-policies.yaml is the platform policy and is not edited
+# here. It prepends `additional_table_rules` to its table rules and defines an
+# empty default for the name; this file defines the real list. OPA builds every
+# ConfigMap carrying the label below into one bundle, both files declare the same
+# package, and so the name resolves to what is written here.
+#
+# The demo table gets the same treatment as the test dataset, so the story is
+# one story across `raw.customers` and `demo.orders`:
+#
+#   /admins      everything. `bob`.
+#   /analysts    EMEA rows only, `customer_id` hashed. `alice`.
+#   superset     the same restricted view, for the reason given in 22-*: one
+#                shared connection serves every Superset user.
+#   anyone else  nothing. `carol`.
+#
+# `data-import`, which loads the table, needs no rule here: 22-* grants it every
+# privilege on both catalogs already. `/admins` likewise reads every schema of
+# the `lakehouse` catalog through the baseline rule there.
+#
+# No values to fill in.
+#
+# IMPORTANT - these rules are evaluated BEFORE every rule in 22-*. A pattern
+#   wider than schema `demo` would shadow the platform's own rules for whoever
+#   it matched, so every rule below names the schema explicitly.
+#
+# IMPORTANT - exactly one bundle file may define `additional_table_rules`. A
+#   second data case adds its rules to THIS list rather than defining the name
+#   again - two definitions are a Rego conflict, and OPA then answers every
+#   Trino request with an error, which Trino turns into a denial.
+####################################################################################
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: demo-trino-policies
+  labels:
+    opa.stackable.tech/bundle: "true"
+data:
+  demo_trino_policies.rego: |
+    package trino_policies
+
+    # The same shape as the customer rules in 22-*: a SQL boolean for the rows,
+    # and a mask expression per column. `customer_id` is hashed with the same
+    # expression as on `raw.customers`, so the two tables still join on it for
+    # an analyst - the hashes agree even though neither side shows the id.
+    demo_row_filter := "region = 'EMEA'"
+
+    demo_column_masks := [
+      {
+        "name": "customer_id",
+        "mask": "'sha256:' || to_hex(sha256(to_utf8(customer_id)))",
+      },
+    ]
+
+    additional_table_rules := [
+      {
+        "user": "superset",
+        "catalog": "lakehouse",
+        "schema": "demo",
+        "table": "orders",
+        "privileges": ["SELECT"],
+        "filter": demo_row_filter,
+        "columns": demo_column_masks,
+      },
+      {
+        "group": "/analysts",
+        "catalog": "lakehouse",
+        "schema": "demo",
+        "table": "orders",
+        "privileges": ["SELECT"],
+        "filter": demo_row_filter,
+        "columns": demo_column_masks,
+      },
+    ]

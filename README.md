@@ -9,6 +9,10 @@ Spark loads data, Apache Airflow orchestrates the loads, Apache Superset serves
 dashboards and SQL Lab, Apache NiFi is there for dataflow, and Keycloak is the
 single place where a person's identity and group membership are defined.
 
+A demo data case sits on top, switchable: an orders table, the policy for it,
+and a Superset dashboard. With `DEMO_DATA=false` the same tree installs the
+platform alone. See "Demo data" below.
+
 ## Try it on minikube
 
 An untouched checkout comes up locally with no editing: every value in
@@ -20,7 +24,7 @@ minikube start --cpus 8 --memory 24g
 ./scripts/install-operators.sh      # once per cluster
 ./scripts/apply.sh lakehouse
 ./scripts/access.sh lakehouse       # URLs and accounts
-./scripts/smoke-test.sh lakehouse   # 32 checks, end to end
+./scripts/smoke-test.sh lakehouse   # 32 checks, plus 8 for the demo data
 ```
 
 Expect five to ten minutes on a cold cluster, most of it pulling images.
@@ -48,6 +52,12 @@ manifests/                          the platform, applied in filename order
   60-superset.yaml                  dashboards and SQL Lab
   61-superset-trino-connection.yaml registers the Trino connection
   70-nifi.yaml                      dataflow
+
+demo/                               the demo data case, applied when DEMO_DATA is true
+  WALKTHROUGH.md                    the presenter's path through it, step by step
+  00-trino-policies.yaml            who may read the demo table, hooked into 22-*
+  10-orders.yaml                    generates and loads lakehouse.demo.orders
+  20-superset-dashboard.yaml        the "Webshop orders" dashboard, and access for analysts
 
 testing/                            local stand-ins for infrastructure you have
   00-minio.yaml                     object store, two scoped users, TLS
@@ -100,6 +110,9 @@ The platform is `manifests/`. Three things come from your environment, and
 | **An S3-compatible object store** | the Iceberg data, and Airflow's task logs | `manifests/02-s3.yaml`, and `S3_ENDPOINT` in `config.env` |
 | **A PostgreSQL server, four empty databases** | `keycloak`, `hive`, `airflow`, `superset` | the `host` of each `metadataDatabase`, and `manifests/00-keycloak.yaml` |
 | **A git repository for the DAGs** | Airflow reads its DAGs only from git | `DAGS_GIT_*` in `config.env` |
+
+And one decision: `DEMO_DATA` in `config.env`, `true` for a demo environment,
+`false` for an installation that should hold nothing but the platform.
 
 Plus a Kubernetes cluster you can create CRDs and ClusterRoles in, `kubectl`,
 `helm` 3, and roughly **20 GiB of memory and 7 CPU** of schedulable room. See
@@ -156,6 +169,7 @@ re-appliable, and there is no build output. At minimum:
 
 ```sh
 LOCAL_STANDINS=false
+DEMO_DATA=false
 EXTERNAL_HOST=lakehouse.example.com
 KEYCLOAK_HOSTNAME=keycloak.example.com
 KEYCLOAK_PORT=443
@@ -228,8 +242,9 @@ being installed into. The script prints the settings to change.
 ./scripts/smoke-test.sh lakehouse
 ```
 
-32 checks, non-zero exit if any fails, in a throwaway pod inside the cluster
-because everything it talks to is a cluster-internal Service. In order:
+32 checks, plus 8 for the demo data while `DEMO_DATA` is true, non-zero exit if
+any fails, in a throwaway pod inside the cluster because everything it talks to
+is a cluster-internal Service. In order:
 
 - Trino answers and OPA is deciding.
 - The Airflow DAG is registered from a path under `/stackable/app/git-0/`, which
@@ -250,6 +265,10 @@ because everything it talks to is a cluster-internal Service. In order:
   against Keycloak, ending in the roles and permissions OPA assigned. For NiFi
   this is also the only check covering the product honouring the policy rather
   than the policy answering in isolation.
+- With the demo data: the table holds its 20 000 rows, the three users get the
+  same three answers on it as on `raw.customers`, the dashboard is published
+  with its five charts, a query through Superset's own connection comes back
+  EMEA-only, and `alice` can see the dashboard.
 
 It is not read-only: it triggers the ingest DAG, which rewrites
 `lakehouse.raw.customers`. The Spark job replaces partitions rather than
@@ -257,6 +276,53 @@ appending, so repeated runs leave the same 2000 rows. Each run leaves a
 `SparkApplication` object behind and nothing collects those, so
 `kubectl delete sparkapplication --all -n lakehouse` is worth running
 occasionally.
+
+## Demo data
+
+`demo/` is a data case on top of the platform, and nothing in `manifests/`
+depends on it. `DEMO_DATA` in `config.env` decides whether `apply.sh` applies
+it; the default is `true`. It is independent of `LOCAL_STANDINS`, so a demo
+environment can run on real infrastructure and a laptop can run the plain
+platform.
+
+`demo/WALKTHROUGH.md` is the presenter's script: what to open, as whom, what
+to type, and what to say. Three manifests:
+
+- **`00-trino-policies.yaml`** gives `/analysts` and the `superset` user the
+  EMEA rows of the demo table with `customer_id` hashed, and nobody else
+  anything beyond what `22-opa-trino-policies.yaml` already grants. It does so
+  through the one extension point that file has: `additional_table_rules`, an
+  empty list there, defined for real here, prepended to the platform's own table
+  rules by OPA when both ConfigMaps land in the same bundle.
+- **`10-orders.yaml`** is a Job that generates 20 000 synthetic webshop orders
+  (seeded, so every install gets the same ones) and loads them through Trino, as
+  `data-import` on the `lakehousewrite` catalog, into `lakehouse.demo.orders`,
+  partitioned by region. Customer ids are drawn from the same range as
+  `data/customers.csv`, so the two tables join. It waits for Trino, empties and
+  refills the table in place, and compacts it. It uses Trino rather than the
+  Spark load path because a Job retries until the platform is there and a
+  SparkApplication does not; the Spark path stays the load path for real data.
+- **`20-superset-dashboard.yaml`** is a Job that creates the dataset, five charts
+  and the published dashboard "Webshop orders" through the Superset API, and
+  grants the `Gamma` role `datasource access` on that one dataset so an analyst
+  can open it. Everything is looked up by name and updated in place, so
+  re-running refreshes the dashboard to what the file says, and overwrites edits
+  made to those objects in the UI.
+
+Every number on the dashboard is the restricted view: Superset reaches Trino as
+the `superset` user, which the policy row-filters and masks whoever is looking.
+That is deliberate, and the reasoning is in the header of
+`manifests/22-opa-trino-policies.yaml`. `bob` sees the unfiltered table by
+querying Trino directly.
+
+Both Jobs wait for what they need, so `apply.sh` does not block on them. Follow
+them with `kubectl logs -n lakehouse job/demo-orders-load -f` and the same for
+`demo-superset-dashboard`. To reload the data, delete the load Job and re-apply
+its manifest, or re-run `apply.sh`.
+
+A second data case adds its rules to the list in `00-trino-policies.yaml`
+rather than defining `additional_table_rules` a second time, and puts its
+manifests next to these three.
 
 ## Deploying a DAG
 
@@ -274,6 +340,12 @@ table through the metastore. Commit both files into the repository
 Because they are real Python and YAML rather than a ConfigMap, they can be
 edited, diffed and linted like source.
 
+That repository is also what Airflow users see: the Code view shows the DAG
+file verbatim, and the repository is theirs to browse. `dags/` therefore names
+nothing outside itself - no manifest, script or example from this package - and
+explains its settings in place. Keep it that way when editing; the package side
+may point at `dags/`, never the reverse.
+
 Locally the repository is the private `airflow-dags` repository in the Forgejo of
 `testing/02-forgejo.yaml`, and `scripts/load-dags.sh` force-pushes `dags/` into
 it. Re-running `apply.sh` re-pushes and overwrites, so Forgejo is not the place
@@ -289,6 +361,10 @@ make the authorization model visible rather than to be useful:
 | `bob` | `/admins` | everything, unmasked | Admin | Admin | full access |
 | `alice` | `/analysts` | EMEA rows only, `full_name` unreadable, `customer_id` hashed, `email` masked | User | Gamma + SQL Lab | read-only |
 | `carol` | none | nothing | Public (sees nothing) | Public (sees nothing) | nothing |
+
+The demo table follows the same lines: `bob` sees every order, `alice` and
+Superset's shared connection see the EMEA orders with `customer_id` hashed,
+`carol` sees nothing.
 
 `carol` is the case worth checking after any policy change. Membership of the
 realm alone must grant no access anywhere, and it is easy to break that by adding

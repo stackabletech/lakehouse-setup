@@ -7,7 +7,8 @@
 #
 # Without arguments it checks manifests/ and dags/, plus testing/ when
 # LOCAL_STANDINS is true and examples/external-credentials.yaml when it is not -
-# the Secrets there are required in that case rather than optional.
+# the Secrets there are required in that case rather than optional - and demo/
+# when DEMO_DATA is true.
 #
 # The rest of examples/ is checked only on request, because those files are
 # applied by hand and an unfilled placeholder in one must not block an install
@@ -33,6 +34,7 @@ if [ -f "$ROOT/config.env" ]; then
   . "$ROOT/config.env"
 fi
 LOCAL_STANDINS="${LOCAL_STANDINS:-true}"
+DEMO_DATA="${DEMO_DATA:-true}"
 
 # Exactly what `render()` in scripts/apply.sh substitutes. Keep the two in step.
 RESOLVED='CHANGEME-(NAMESPACE|EXTERNAL-HOST|KEYCLOAK-(HOSTNAME|PORT|URL|CA|BACKCHANNEL-DYNAMIC)|AIRFLOW-URL|S3-(CA(-VOLUME)?|ENDPOINT)|NIFI-(HOSTNAME|LISTENER-CLASS)|DAGS-GIT-(REPO|BRANCH|FOLDER|TLS|CA-VOLUME)|FORGEJO-URL)'
@@ -54,6 +56,9 @@ if [ "${#TARGETS[@]}" -eq 0 ]; then
   else
     TARGETS+=("$ROOT/examples/external-credentials.yaml")
   fi
+  if [ "$DEMO_DATA" = true ]; then
+    TARGETS+=("$ROOT/demo")
+  fi
 fi
 
 # Whether a path is substituted on the way to the cluster, which decides whether
@@ -62,7 +67,7 @@ fi
 # server; against a real repository it is committed verbatim.
 rendered() {
   case "${1#"$ROOT"/}" in
-    manifests|manifests/*|testing|testing/*) return 0 ;;
+    manifests|manifests/*|testing|testing/*|demo|demo/*) return 0 ;;
     dags|dags/*) [ "$LOCAL_STANDINS" = true ] ;;
     *) return 1 ;;
   esac

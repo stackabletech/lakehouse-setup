@@ -1,0 +1,260 @@
+####################################################################################
+# The demo table: `lakehouse.demo.orders`, 20 000 synthetic webshop orders.
+#
+# A Job generates the rows and loads them through Trino, as the `data-import`
+# technical user on the `lakehousewrite` catalog. Nothing is uploaded to the
+# object store and nothing is committed to the DAG repository: the whole data
+# case is this file and the two next to it, which is what makes it something
+# to switch on and off rather than something to install.
+#
+# Why Trino and not the Spark load path. A SparkApplication runs once and is not
+# retried, so it would have to be submitted only after the object store, the
+# metastore and the upload it reads from are all ready - orchestration this
+# package does with Airflow, not with a manifest. A Job retries until Trino
+# answers, and Trino answering means the metastore and the object store are
+# there too. The Spark path stays what it is: the load path for real data,
+# exercised by the DAG in dags/ and verified by the smoke test.
+#
+# The rows are generated here rather than committed, deliberately: 20 000 rows
+# do not fit a ConfigMap, and a demo dataset does not need to be diffed. They
+# are seeded, so every install gets the same 20 000 rows. Customer ids are
+# drawn from the same range as data/customers.csv, so the two tables join.
+#
+# Re-running is safe and is how the table is refreshed: the table is emptied and
+# reloaded in place, so anything referencing it (the Superset dataset, a saved
+# query) keeps working. scripts/apply.sh deletes the completed Job first,
+# because a Job's pod template is immutable.
+#
+# No values to fill in.
+#
+# IMPORTANT - the load bypasses nothing. `data-import` goes through the same
+#   OPA policy as everyone else; it succeeds because 22-* grants it ownership.
+#   Removing that grant breaks this Job, which is the intended coupling.
+#
+# NOTE - the schema location is given explicitly. The metastore has no default
+#   warehouse directory on the object store, and without a location Trino would
+#   create the schema under a local path the workers cannot share.
+#
+# NOTE - `source=batch` puts the load into the `global.batch` resource group of
+#   manifests/32-trino.yaml: one query at a time, next to a running dashboard.
+####################################################################################
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: demo-orders-load-script
+data:
+  load_orders.py: |
+    """Generate the demo orders and load them into the lakehouse through Trino."""
+    import base64
+    import json
+    import random
+    import ssl
+    import sys
+    import time
+    import urllib.error
+    import urllib.request
+    from datetime import date, timedelta
+
+    # The coordinator's certificate carries its fully qualified Service name and
+    # nothing else, so that is what the connection has to use.
+    NAMESPACE = open(
+        "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+    ).read().strip()
+    TRINO = f"https://trino-coordinator.{NAMESPACE}.svc.cluster.local:8443"
+    USER = "data-import"
+    PASSWORD = open("/trino-credentials/data-import").read().strip()
+    SSL_CONTEXT = ssl.create_default_context(cafile="/cluster-internal-ca/ca.crt")
+
+    SCHEMA = "lakehousewrite.demo"
+    SCHEMA_LOCATION = "s3://lakehouse/warehouse/demo.db"
+    TABLE = f"{SCHEMA}.orders"
+
+    ROWS = 20000
+    SEED = 20260916
+    BATCH = 2000
+    CUSTOMERS = 2000
+    START = date(2025, 1, 1)
+    END = date(2026, 9, 1)
+
+    # Region shares are uneven so the charts have a shape, and EMEA is the
+    # largest because it is the one an analyst gets to see.
+    REGIONS = ["EMEA", "AMER", "APAC"]
+    REGION_WEIGHTS = [0.5, 0.3, 0.2]
+    CATEGORIES = {
+        "electronics": (80.0, 900.0),
+        "home": (15.0, 250.0),
+        "fashion": (20.0, 150.0),
+        "sports": (25.0, 400.0),
+        "books": (8.0, 40.0),
+        "toys": (10.0, 90.0),
+    }
+    STATUSES = ["delivered", "shipped", "returned", "cancelled"]
+    STATUS_WEIGHTS = [0.80, 0.08, 0.07, 0.05]
+
+
+    def order_day(rng):
+        """A date skewed towards recent months, with a November and December peak."""
+        span = (END - START).days
+        while True:
+            day = START + timedelta(days=int(span * rng.random() ** 0.8))
+            if day.month in (11, 12) or rng.random() < 0.65:
+                return day
+
+
+    def generate():
+        rng = random.Random(SEED)
+        for index in range(1, ROWS + 1):
+            category = rng.choice(list(CATEGORIES))
+            low, high = CATEGORIES[category]
+            quantity = rng.choices([1, 2, 3, 4, 5], weights=[60, 22, 10, 5, 3])[0]
+            unit_price = round(rng.uniform(low, high), 2)
+            yield (
+                f"ORD-{index:08d}",
+                f"CUST-{rng.randint(1, CUSTOMERS):06d}",
+                order_day(rng).isoformat(),
+                rng.choices(REGIONS, weights=REGION_WEIGHTS)[0],
+                category,
+                quantity,
+                unit_price,
+                round(quantity * unit_price, 2),
+                rng.choices(STATUSES, weights=STATUS_WEIGHTS)[0],
+            )
+
+
+    def trino(query):
+        """Run one statement to completion. Returns the rows; raises on error."""
+        credentials = base64.b64encode(f"{USER}:{PASSWORD}".encode()).decode()
+        headers = {
+            "X-Trino-User": USER,
+            "X-Trino-Source": "batch",
+            "Authorization": f"Basic {credentials}",
+        }
+        url, body, rows = f"{TRINO}/v1/statement", query.encode(), []
+        while True:
+            request = urllib.request.Request(
+                url, data=body, headers=headers, method="POST" if body else "GET"
+            )
+            with urllib.request.urlopen(request, context=SSL_CONTEXT) as response:
+                document = json.loads(response.read())
+            if "error" in document:
+                raise RuntimeError(document["error"].get("message", document["error"]))
+            rows += document.get("data") or []
+            if not document.get("nextUri"):
+                return rows
+            url, body = document["nextUri"], None
+            time.sleep(0.2)
+
+
+    def literal(value):
+        if isinstance(value, str):
+            return "'" + value.replace("'", "''") + "'"
+        return str(value)
+
+
+    # Trino takes minutes to come up on a cold cluster, and its first query against
+    # the write catalog is what proves the metastore and the object store are
+    # reachable too. Waiting here rather than failing keeps the Job's retries for
+    # real errors.
+    deadline = time.time() + 1800
+    while True:
+        try:
+            trino("SHOW SCHEMAS FROM lakehousewrite")
+            break
+        except (urllib.error.URLError, RuntimeError, OSError) as error:
+            if time.time() > deadline:
+                sys.exit(f"trino did not become available: {error}")
+            print(f"waiting for trino ({str(error)[:120]})")
+            time.sleep(10)
+
+    trino(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA} WITH (location = '{SCHEMA_LOCATION}')")
+    trino(
+        f"""
+        CREATE TABLE IF NOT EXISTS {TABLE} (
+            order_id     varchar,
+            customer_id  varchar,
+            order_date   date,
+            region       varchar,
+            category     varchar,
+            quantity     integer,
+            unit_price   decimal(10, 2),
+            amount       decimal(12, 2),
+            status       varchar
+        )
+        WITH (partitioning = ARRAY['region'])
+        """
+    )
+
+    # Emptied and refilled rather than dropped and recreated, so the table keeps
+    # its identity for everything that references it.
+    trino(f"DELETE FROM {TABLE}")
+
+    batch, loaded = [], 0
+    for row in generate():
+        order_id, customer_id, day, region, category, quantity, price, amount, status = row
+        batch.append(
+            "("
+            + ", ".join(
+                [
+                    literal(order_id),
+                    literal(customer_id),
+                    f"DATE '{day}'",
+                    literal(region),
+                    literal(category),
+                    str(quantity),
+                    f"DECIMAL '{price:.2f}'",
+                    f"DECIMAL '{amount:.2f}'",
+                    literal(status),
+                ]
+            )
+            + ")"
+        )
+        if len(batch) == BATCH:
+            trino(f"INSERT INTO {TABLE} VALUES {', '.join(batch)}")
+            loaded += len(batch)
+            print(f"loaded {loaded} rows")
+            batch = []
+    if batch:
+        trino(f"INSERT INTO {TABLE} VALUES {', '.join(batch)}")
+        loaded += len(batch)
+        print(f"loaded {loaded} rows")
+
+    # Each INSERT above wrote its own files per partition. One compaction pass
+    # leaves a table that looks like it was loaded once.
+    trino(f"ALTER TABLE {TABLE} EXECUTE optimize")
+
+    print(f"rows in {TABLE} by region:")
+    for region, count in trino(f"SELECT region, count(*) FROM {TABLE} GROUP BY 1 ORDER BY 1"):
+        print(f"  {region:6} {count}")
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: demo-orders-load
+spec:
+  backoffLimit: 10
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: load
+          image: docker.io/library/python:3.12-slim
+          command: ["python", "-u", "/script/load_orders.py"]
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: "1", memory: 512Mi}
+          volumeMounts:
+            - {name: script, mountPath: /script}
+            - {name: trino-credentials, mountPath: /trino-credentials}
+            # The platform CA, from the TrustStore in manifests/03-truststore.yaml.
+            - {name: cluster-internal-ca, mountPath: /cluster-internal-ca}
+      volumes:
+        - name: script
+          configMap:
+            name: demo-orders-load-script
+        - name: trino-credentials
+          secret:
+            secretName: trino-technical-user
+        - name: cluster-internal-ca
+          configMap:
+            name: cluster-internal-ca

@@ -57,6 +57,11 @@
 # NOTE - `data-import` is a static Trino credential, not a Keycloak account. Make
 #   sure no human account in the realm ever carries that username: the policies
 #   match on the name, not on where it came from.
+#
+# NOTE - `additional_table_rules` is the one extension point. It is prepended
+#   to the table rules and is empty unless another bundle file in this package
+#   defines it - demo/00-trino-policies.yaml does, for the demo tables. That is
+#   what lets a data case ship its own policy without a copy of this file.
 ####################################################################################
 ---
 apiVersion: v1
@@ -93,6 +98,10 @@ data:
       },
     ]
 
+    # Table rules another bundle file may contribute; see the header. A default
+    # rule is what makes the name resolve to an empty list when no file does.
+    default additional_table_rules := []
+
     policies := {
       "catalogs": [
         # ── technical user ──────────────────────────────────────────────
@@ -128,7 +137,7 @@ data:
           "owner": true,
         },
       ],
-      "tables": [
+      "tables": array.concat(additional_table_rules, [
         # ── technical user ──────────────────────────────────────────────
         {
           "user": "data-import",
@@ -205,7 +214,7 @@ data:
           "schema": "jdbc|metadata",
           "privileges": ["SELECT"],
         },
-      ],
+      ]),
       "system_information": [],
       "queries": [
         # Every user may view and cancel their own queries, and nobody else's.

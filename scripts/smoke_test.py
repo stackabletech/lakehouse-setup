@@ -25,6 +25,10 @@ What it checks, in order, because each step depends on the one before:
      permissions OPA assigned. These are the checks that exercise the redirect
      chain rather than an API token, and for NiFi it is the only check that
      covers the product's own use of the policy rather than the policy alone.
+  8. With DEMO_DATA set (scripts/smoke-test.sh passes it through): the demo
+     table is loaded, its policy restricts the same way, the dashboard is
+     published and queries through the shared connection, and an analyst can
+     open it.
 
 TLS: this harness does not verify certificates. The products do - that they work
 at all is the proof. Verifying here would mean mounting the CA into a throwaway
@@ -396,6 +400,7 @@ check("NiFi is serving and refuses an unauthenticated request", status == 401, f
 # ── 6. Superset's connection to Trino ───────────────────────────────────────
 print("\nSuperset")
 
+superset_auth = None
 status, document = http(
     "POST",
     f"{SUPERSET}/api/v1/security/login",
@@ -442,7 +447,8 @@ print("\nSuperset login through Keycloak")
 def oidc_login(username, password):
     """Complete the authorization-code flow the way a browser would.
 
-    Returns the set of Superset role names the user ends up with.
+    Returns the set of Superset role names the user ends up with, and the
+    logged-in browser, which the demo checks reuse.
 
     The roles come out of the `data-bootstrap` blob the welcome page embeds for
     its frontend, not from `/api/v1/me/` - that endpoint does not report roles
@@ -450,26 +456,26 @@ def oidc_login(username, password):
     """
     browser, form = keycloak_form(f"{SUPERSET}/login/keycloak")
     if form is None:
-        return "no Keycloak login form"
+        return "no Keycloak login form", browser
     submit_keycloak_form(browser, form, username, password)
     try:
         page = browser.open(f"{SUPERSET}/superset/welcome/").read().decode()
     except urllib.error.HTTPError as error:
-        return f"welcome page returned HTTP {error.code}"
+        return f"welcome page returned HTTP {error.code}", browser
     blob = re.search(r'data-bootstrap="([^"]+)"', page)
     if not blob:
-        return "no bootstrap data on the welcome page"
+        return "no bootstrap data on the welcome page", browser
     document = json.loads(html.unescape(blob.group(1)))
-    return set(document.get("user", {}).get("roles") or {})
+    return set(document.get("user", {}).get("roles") or {}), browser
 
 
-bob_roles = oidc_login("bob", "bob")
+bob_roles, _ = oidc_login("bob", "bob")
 check(
     "/admins logs in and OPA grants Admin",
     bob_roles == {"Admin"},
     f"got {bob_roles}",
 )
-alice_roles = oidc_login("alice", "alice")
+alice_roles, alice_browser = oidc_login("alice", "alice")
 check(
     "/analysts logs in and OPA grants Gamma and sql_lab",
     alice_roles == {"Gamma", "sql_lab"},
@@ -478,7 +484,7 @@ check(
 # The interesting case: the login succeeds, and the user lands on a role that
 # carries no permissions. Superset returns HTTP 500 for a user with no roles at
 # all, so `Public` rather than an empty set is the correct outcome.
-carol_roles = oidc_login("carol", "carol")
+carol_roles, _ = oidc_login("carol", "carol")
 check(
     "a user in no group logs in and lands on Public with nothing",
     carol_roles == {"Public"},
@@ -540,6 +546,106 @@ check(
     carol_view == "HTTP 403",
     f"got {carol_view}",
 )
+
+
+# ── 8. The demo data case ───────────────────────────────────────────────────
+# Only while demo/ is applied. Its two Jobs wait for the platform themselves, so
+# on a fresh install they can still be running when this test starts - which is
+# why the first check waits for the table to fill rather than reading it once.
+if os.environ.get("DEMO_DATA", "true") == "true":
+    print("\nDemo data")
+
+    DEMO_TABLE = "lakehouse.demo.orders"
+    DEMO_ROWS = 20000
+    demo_total, deadline = None, time.time() + 900
+    while time.time() < deadline:
+        columns, rows = trino(f"SELECT count(*) FROM {DEMO_TABLE}")
+        demo_total = rows[0][0] if columns != "ERROR" and rows else None
+        if demo_total == DEMO_ROWS:
+            break
+        print(f"  waiting for the demo load ({rows if columns == 'ERROR' else demo_total} so far)")
+        time.sleep(15)
+    check(
+        "the load Job filled the demo table",
+        demo_total == DEMO_ROWS,
+        f"expected {DEMO_ROWS} rows, got {demo_total}",
+    )
+
+    columns, rows = trino(f"SELECT count(*) FROM {DEMO_TABLE} WHERE region = 'EMEA'")
+    demo_emea = rows[0][0] if columns != "ERROR" and rows else None
+
+    columns, rows = trino(f"SELECT count(*) FROM {DEMO_TABLE}", user="bob", token=bob)
+    check("/admins sees every order", columns != "ERROR" and rows == [[demo_total]], f"got {rows}")
+
+    columns, rows = trino(
+        f"SELECT count(*), min(customer_id) FROM {DEMO_TABLE}", user="alice", token=alice
+    )
+    restricted = rows[0] if columns != "ERROR" and rows else [None, ""]
+    check(
+        "/analysts sees EMEA orders with customer_id hashed",
+        restricted[0] == demo_emea and str(restricted[1]).startswith("sha256:"),
+        f"expected {demo_emea} rows, got {restricted}",
+    )
+
+    columns, rows = trino(f"SELECT count(*) FROM {DEMO_TABLE}", user="carol", token=carol)
+    check("a user in no group is denied the demo table", columns == "ERROR", f"got {rows}")
+
+    if superset_auth:
+        status, document = http(
+            "GET", f"{SUPERSET}/api/v1/dashboard/webshop-orders", headers=superset_auth
+        )
+        dashboard = document.get("result", {}) if status == 200 else {}
+        check(
+            "the demo dashboard is published",
+            dashboard.get("published") is True,
+            f"got {status} {document if status != 200 else dashboard.get('published')}",
+        )
+        status, document = http(
+            "GET", f"{SUPERSET}/api/v1/dashboard/webshop-orders/charts", headers=superset_auth
+        )
+        charts = document.get("result", []) if status == 200 else []
+        check("with its five charts", len(charts) == 5, f"got {[c.get('slice_name') for c in charts]}")
+
+        # The dataset queried through Superset's own connection. What comes back
+        # is what a dashboard shows, and it has to be the restricted view.
+        query = urllib.parse.quote(
+            "(filters:!((col:schema,opr:eq,value:demo),(col:table_name,opr:eq,value:orders)))"
+        )
+        status, document = http("GET", f"{SUPERSET}/api/v1/dataset/?q={query}", headers=superset_auth)
+        datasets = document.get("result", []) if status == 200 else []
+        regions = None
+        if datasets:
+            status, document = http(
+                "POST",
+                f"{SUPERSET}/api/v1/chart/data",
+                headers=superset_auth,
+                body={
+                    "datasource": {"id": datasets[0]["id"], "type": "table"},
+                    "queries": [{"columns": ["region"], "metrics": ["count"], "row_limit": 10}],
+                    "result_format": "json",
+                    "result_type": "full",
+                },
+            )
+            if status == 200:
+                regions = sorted(row["region"] for row in document["result"][0]["data"])
+        check(
+            "the dataset answers through the shared connection, EMEA only",
+            regions == ["EMEA"],
+            f"got {status} {regions if regions is not None else document}",
+        )
+
+    # The dashboard Job grants Gamma access to the dataset; this is what that
+    # grant is for. The browser is the one alice logged in with above.
+    try:
+        listing = json.loads(alice_browser.open(f"{SUPERSET}/api/v1/dashboard/").read())
+        visible = [d.get("slug") for d in listing.get("result", [])]
+    except (urllib.error.HTTPError, ValueError) as error:
+        visible = str(error)
+    check(
+        "/analysts can see the demo dashboard",
+        "webshop-orders" in visible,
+        f"alice sees {visible}",
+    )
 
 
 # ── verdict ─────────────────────────────────────────────────────────────────

@@ -1,21 +1,14 @@
 """Submit a SparkApplication to the Stackable Spark operator and wait for it.
 
-This is the Airflow-to-Spark path. Airflow creates a SparkApplication through
-the Kubernetes API using its own ServiceAccount (the technical identity, see
-manifests/50-airflow-rbac.yaml) and then polls its status. No user credential
-is involved and no user authorization is evaluated.
+Airflow creates a SparkApplication through the Kubernetes API using its own
+ServiceAccount, the platform's technical identity for this, and then polls its
+status. No user credential is involved and no user authorization is evaluated:
+the Spark job runs with the object store identity configured in its manifest.
 
 The file next to this one, `spark_job.yaml`, is the SparkApplication that gets
-submitted. Both reach Airflow through git-sync, so the path they live under is
-chosen by the operator and changes with the number of git-sync entries - which
-is why the manifest is located relative to this file rather than by an absolute
-path.
-
-IMPORTANT - `spark_job.yaml` is the same job as `examples/spark-iceberg-job.yaml`,
-  duplicated so that the DAGs directory is self-contained and can be pushed to a
-  repository on its own. The comments explaining each setting are in that file.
-  Changing the security or catalog settings in one means changing them in the
-  other - or deleting whichever of the two is unused.
+submitted. Both arrive through git-sync, so the path they live under is chosen
+by the platform and can change - which is why the manifest is located relative
+to this file rather than by an absolute path.
 
 NOTE - the DAG is triggered manually (`schedule=None`). Give it a schedule once
   it does real work.
@@ -46,8 +39,8 @@ API_GROUP = "spark.stackable.tech"
 API_VERSION = "v1alpha1"
 PLURAL = "sparkapplications"
 
-# Connection defined by AIRFLOW_CONN_KUBERNETES_IN_CLUSTER in
-# manifests/51-airflow.yaml.
+# Provided by the platform: the in-cluster Kubernetes connection, authenticating
+# with the pod's own ServiceAccount.
 KUBERNETES_CONN_ID = "kubernetes_in_cluster"
 
 # Next to this file in the repository, wherever git-sync put the checkout.

@@ -29,6 +29,13 @@
 # local rig applies the NodePorts because the smoke test's browser logins need
 # them.
 #
+# ── With and without the demo data ────────────────────────────────────────────
+# demo/ is a data case on top of the platform: a table, its authorization rules
+# and a Superset dashboard. DEMO_DATA in config.env decides whether it is
+# applied. Nothing in manifests/ depends on it, so a platform without it is the
+# same platform - which is the point: one tree serves a demo environment and a
+# plain installation.
+#
 # ── Substitutions ─────────────────────────────────────────────────────────────
 # The manifests carry placeholders for everything deployment-specific. They are
 # resolved from config.env and substituted on the way to the cluster, so the
@@ -77,11 +84,16 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # files are committed to the DAG repository rather than applied here, so an
 # unfilled one is a broken Spark job later rather than a reason to refuse the
 # platform now. It is reported at the end instead.
+check_targets=(manifests)
 if [ "$LOCAL_STANDINS" = true ]; then
-  "$ROOT/scripts/check-config.sh" manifests testing
+  check_targets+=(testing)
 else
-  "$ROOT/scripts/check-config.sh" manifests examples/external-credentials.yaml
+  check_targets+=(examples/external-credentials.yaml)
 fi
+if [ "$DEMO_DATA" = true ]; then
+  check_targets+=(demo)
+fi
+"$ROOT/scripts/check-config.sh" "${check_targets[@]}"
 echo
 
 echo "namespace:      $NAMESPACE"
@@ -89,6 +101,7 @@ echo "keycloak:       $KEYCLOAK_URL"
 echo "airflow:        $AIRFLOW_URL"
 echo "nifi:           $NIFI_HOSTNAME  (listener: $NIFI_LISTENER_CLASS)"
 echo "dags:           $DAGS_GIT_REPO  (branch: $DAGS_GIT_BRANCH, folder: $DAGS_GIT_FOLDER)"
+echo "demo data:      $DEMO_DATA"
 echo
 
 kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
@@ -159,9 +172,10 @@ apply() {
   render "$1" | kubectl apply -n "$NAMESPACE" --server-side --force-conflicts -f -
 }
 
-# A completed Job's pod template is immutable, so re-applying one fails. All four
-# are idempotent, so deleting them first simply re-runs them.
-for job in minio-init superset-trino-connection dataset-upload dags-git-push; do
+# A completed Job's pod template is immutable, so re-applying one fails. All of
+# these are idempotent, so deleting them first simply re-runs them.
+for job in minio-init superset-trino-connection dataset-upload dags-git-push \
+           demo-orders-load demo-superset-dashboard; do
   kubectl delete job "$job" -n "$NAMESPACE" --ignore-not-found --wait >/dev/null 2>&1 || true
 done
 
@@ -192,6 +206,16 @@ for manifest in "$ROOT"/manifests/*.yaml; do
   [ "$manifest" = "$ROOT/manifests/03-truststore.yaml" ] && continue
   apply "$manifest"
 done
+
+# The demo data case. Its two Jobs wait for Trino and for the Superset
+# connection themselves, so it can go straight after the platform.
+if [ "$DEMO_DATA" = true ]; then
+  echo
+  echo "--- demo/ (the demo data case) ---"
+  for manifest in "$ROOT"/demo/*.yaml; do
+    apply "$manifest"
+  done
+fi
 
 # The dataset needs the read-write credentials from manifests/02-s3.yaml, which
 # is why it comes after the platform rather than with the rest of testing/.
@@ -226,6 +250,12 @@ if [ "$LOCAL_STANDINS" != true ]; then
       | grep -Ev '^[^:]+:[0-9]+:[[:space:]]*#' | sed "s|$ROOT/|  |"
     echo
   fi
+fi
+if [ "$DEMO_DATA" = true ]; then
+  echo "The demo data is loaded by two Jobs that wait for Trino and Superset:"
+  echo "  kubectl logs -n $NAMESPACE job/demo-orders-load -f"
+  echo "  kubectl logs -n $NAMESPACE job/demo-superset-dashboard -f"
+  echo
 fi
 echo "Then:"
 echo "  ./scripts/access.sh $NAMESPACE      URLs and accounts"
